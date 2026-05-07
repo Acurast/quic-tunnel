@@ -1,0 +1,11 @@
+before_install:
+  - sdk install java 17.0.9-tem
+  - sdk use java 17.0.9-tem
+  - wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O android-commandlinetools.zip && unzip -q android-commandlinetools.zip -d ${ANDROID_HOME} && rm android-commandlinetools.zip
+  - ${ANDROID_HOME}/cmdline-tools/bin/sdkmanager --sdk_root=${ANDROID_HOME} "ndk;29.0.14206865"
+  - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  - source $HOME/.cargo/env
+  - rustup target add aarch64-linux-android
+  - rustup target add armv7-linux-androideabi
+  - cd ./android
+  - sed -i 's/rust = "[0-9.]*"/rust = "0.9.4"/' ./gradle/libs.versions.toml

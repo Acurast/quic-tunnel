@@ -1,0 +1,32 @@
+[package]
+name = "tunnel-client"
+authors = { workspace = true }
+version = { workspace = true }
+edition = { workspace = true }
+
+[lib]
+name = "tunnel_client"
+crate-type = ["lib"]
+
+[dependencies]
+tunnel-common = { workspace = true }
+tokio = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen = { workspace = true }
+yasna = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+h2 = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-native-certs = { workspace = true }
+x509-parser = { workspace = true }
+instant-acme = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

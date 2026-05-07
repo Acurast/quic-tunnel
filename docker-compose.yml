@@ -1,0 +1,61 @@
+services:
+  server:
+    build:
+      context: .
+      target: server
+    environment:
+      # Optional — comma-separated allowlist of client domain suffixes.
+      # If unset/empty, all client domains are accepted.
+      DOMAIN_SUFFIX: ${DOMAIN_SUFFIX:-}
+      # Server cert — pick one mode. TLS_CERT_PATH/TLS_KEY_PATH are used in
+      # both modes (in mode 2 they are written by the ACME provisioner).
+      # 1. Externally managed cert (e.g. certbot host volume); reloaded from disk within 60s
+      # TLS_CERT_PATH: /data/fullchain.pem
+      # TLS_KEY_PATH:  /data/privkey.pem
+      # 2. Server provisions its own LE cert via TLS-ALPN-01
+      # ACME_DOMAIN: ${ACME_DOMAIN}
+      # ACME_EMAIL:  ${ACME_EMAIL}
+      # ACME_STAGING: "1"
+      # TLS_CERT_PATH:   /data/server_cert.pem
+      # TLS_KEY_PATH:    /data/server.key
+      # ACME_CREDS_PATH: /data/server_acme_creds.json
+      # ACME_RENEW_DAYS: "30"
+      # 3. Neither set → in-memory self-signed (dev only)
+    ports:
+      - "443:443/tcp" # TLS-ALPN-01 challenge port (Let's Encrypt validation)
+      - "4433:4433/udp" # QUIC (agent connections)
+      - "4433:4433/tcp" # HTTP/2 (agent connections)
+      - "8443:8443/tcp" # Public port (user connections)
+    volumes:
+      - server-data:/data
+    restart: unless-stopped
+
+  client:
+    build:
+      context: .
+      target: client
+    environment:
+      # Required
+      SERVER_ADDR: ${SERVER_ADDR:-server:4433}
+      DOMAIN_SUFFIX: ${DOMAIN_SUFFIX}
+      # Optional
+      LOCAL_ADDR: ${LOCAL_ADDR:-host.docker.internal:3000}
+      POOL_SIZE: ${POOL_SIZE:-4}
+      # PRIMARY_KEY: /data/client.key
+      # ACME_EMAIL: ${ACME_EMAIL}
+      # ACME_CREDS_PATH: /data/acme_credentials.json
+      # ACME_STAGING: "1"
+      # FORCE_HTTP2: "1"
+      # CERT_PEM_PATH: /data/acme_cert.pem   # pre-seeds ACME cache; ACME still renews on expiry
+      # PRIMARY_CERT_EXTENSION_HEX: deadbeef
+      # SECONDARY_KEY: /data/client2.key     # opens a second self-signed tunnel (no ACME)
+      # SECONDARY_CERT_EXTENSION_HEX: cafe
+    volumes:
+      - client-data:/data
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  server-data:
+  client-data:
