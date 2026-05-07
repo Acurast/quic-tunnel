@@ -1,0 +1,23 @@
+[package]
+name = "relay"
+authors = { workspace = true }
+version = { workspace = true }
+edition = { workspace = true }
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[dependencies]
+tunnel-server = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+futures = { workspace = true }

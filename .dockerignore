@@ -1,0 +1,9 @@
+target/
+.git/
+*.md
+*.log
+*.bin
+*.key
+acme_credentials.json
+server_*.log
+client_*.log

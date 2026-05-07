@@ -1,0 +1,15 @@
+[package]
+name = "tunnel-common"
+authors = { workspace = true }
+version = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+tokio = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+h2 = { workspace = true }
+bytes = { workspace = true }

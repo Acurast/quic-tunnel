@@ -1,0 +1,262 @@
+use log::{debug, error, info, warn};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::{TcpListener, TcpStream};
+use tunnel_common::collect_h2_body;
+
+use crate::util::{
+    allowed_suffix, compute_txt_expected, custom_data_from_cert, id_from_cert, pubkey_from_cert,
+    register,
+};
+use crate::{Agent, AgentMap, AuthHandler, PendingAlpnConn, PendingAlpnMap};
+
+pub(crate) async fn run_h2_listener(
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    agents: AgentMap,
+    pending: PendingAlpnMap,
+    domain_suffixes: Arc<Vec<String>>,
+    auth_handler: Option<AuthHandler>,
+    resolver: Arc<hickory_resolver::TokioAsyncResolver>,
+) {
+    while let Ok((tcp_stream, remote)) = listener.accept().await {
+        debug!("H2: incoming connection from {}", remote);
+        let (acceptor, agents, pending, domain_suffixes, auth_handler, resolver) = (
+            acceptor.clone(),
+            agents.clone(),
+            pending.clone(),
+            domain_suffixes.clone(),
+            auth_handler.clone(),
+            resolver.clone(),
+        );
+        tokio::spawn(handle_h2_connection(
+            tcp_stream,
+            remote,
+            acceptor,
+            agents,
+            pending,
+            domain_suffixes,
+            auth_handler,
+            resolver,
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_h2_connection(
+    tcp_stream: TcpStream,
+    remote: SocketAddr,
+    acceptor: tokio_rustls::TlsAcceptor,
+    agents: AgentMap,
+    pending: PendingAlpnMap,
+    domain_suffixes: Arc<Vec<String>>,
+    auth_handler: Option<AuthHandler>,
+    resolver: Arc<hickory_resolver::TokioAsyncResolver>,
+) -> Option<()> {
+    let _ = tcp_stream.set_nodelay(true);
+    let tls_stream = match acceptor.accept(tcp_stream).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("H2: TLS handshake failed from {}: {}", remote, e);
+            return None;
+        }
+    };
+    let peer_cert = tls_stream
+        .get_ref()
+        .1
+        .peer_certificates()?
+        .first()?
+        .as_ref();
+    let id = match id_from_cert(peer_cert) {
+        Some(id) => id,
+        None => {
+            warn!("H2: could not derive client_id from {}", remote);
+            return None;
+        }
+    };
+    let custom_data = custom_data_from_cert(peer_cert);
+    if let Some(ref bytes) = custom_data {
+        info!("H2: client_id={} custom data ({} bytes)", id, bytes.len());
+    }
+    let auth_token: Option<Vec<u8>> = if let Some(ref handler) = auth_handler {
+        let pubkey = match pubkey_from_cert(peer_cert) {
+            Some(pk) => pk,
+            None => {
+                warn!("H2: could not extract pubkey from {}", remote);
+                drop(tls_stream);
+                return None;
+            }
+        };
+        match handler(&pubkey, custom_data.as_deref()) {
+            Ok(token) => token,
+            Err(e) => {
+                warn!("H2: auth denied for client_id={} ({}): {}", id, remote, e);
+                drop(tls_stream);
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    debug!(
+        "H2: client_id={} ({}), starting control exchange",
+        id, remote
+    );
+
+    let (mut h2_sender, h2_conn) = match h2::client::Builder::new()
+        .initial_window_size(10_000_000)
+        .initial_connection_window_size(10_000_000)
+        .handshake(tls_stream)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            error!("H2: handshake failed for {}: {}", id, e);
+            return None;
+        }
+    };
+
+    h2_ctrl_exchange(
+        &mut h2_sender,
+        &id,
+        &pending,
+        &domain_suffixes,
+        auth_token,
+        &resolver,
+    )
+    .await?;
+
+    register(&agents, id, Agent::H2(h2_sender), async move {
+        let _ = h2_conn.await;
+    })
+    .await;
+    Some(())
+}
+
+async fn h2_ctrl_exchange(
+    sender: &mut h2::client::SendRequest<bytes::Bytes>,
+    id: &str,
+    pending: &PendingAlpnMap,
+    domain_suffixes: &[String],
+    auth_token: Option<Vec<u8>>,
+    resolver: &hickory_resolver::TokioAsyncResolver,
+) -> Option<()> {
+    // Step 1: GET /_ctrl/domain — client responds with domain in body
+    let domain = {
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/_ctrl/domain")
+            .body(())
+            .unwrap();
+        let (resp_future, _) = match sender.send_request(req, true) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("H2: failed to send /_ctrl/domain for {}: {}", id, e);
+                return None;
+            }
+        };
+        let body = match collect_h2_body(resp_future.await.ok()?.into_body()).await {
+            Ok(b) => b,
+            Err(e) => {
+                error!("H2: failed to read domain body from {}: {}", id, e);
+                return None;
+            }
+        };
+        match String::from_utf8(body.to_vec()) {
+            Ok(d) => d,
+            Err(e) => {
+                error!("H2: invalid domain encoding from {}: {}", id, e);
+                return None;
+            }
+        }
+    };
+    if domain.split('.').next() != Some(id) {
+        error!("H2: domain {} does not match client_id {}", domain, id);
+        return None;
+    }
+    if !allowed_suffix(&domain, domain_suffixes) {
+        error!(
+            "H2: domain {} has no allowed suffix (allowed: {:?})",
+            domain, domain_suffixes
+        );
+        return None;
+    }
+    debug!("H2: domain={}", domain);
+
+    // Step 1b: DNS TXT validation (only when auth_handler returned a deployment_source)
+    if let Some(ref deployment_source) = auth_token {
+        let host = domain.split_once('.').map(|x| x.1).unwrap_or("");
+        let txt_name = format!("_acu.{}.", host);
+        let expected = compute_txt_expected(deployment_source, host);
+        match resolver.txt_lookup(&txt_name).await {
+            Ok(lookup) => {
+                let matched = lookup.iter().any(|r| {
+                    r.txt_data()
+                        .iter()
+                        .any(|d| d.as_ref() == expected.as_bytes())
+                });
+                if !matched {
+                    warn!(
+                        "H2: TXT record mismatch for {} (client_id={})",
+                        txt_name, id
+                    );
+                    return None;
+                }
+            }
+            Err(e) => {
+                warn!("H2: TXT lookup failed for {}: {}", txt_name, e);
+                return None;
+            }
+        }
+    }
+
+    // Step 2: GET /_ctrl/key_auth — empty means cert cached, non-empty means ACME in progress
+    let key_auth = {
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/_ctrl/key_auth")
+            .body(())
+            .unwrap();
+        let (resp_future, _) = match sender.send_request(req, true) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("H2: failed to send /_ctrl/key_auth for {}: {}", id, e);
+                return None;
+            }
+        };
+        let body = match collect_h2_body(resp_future.await.ok()?.into_body()).await {
+            Ok(b) => b,
+            Err(e) => {
+                error!("H2: failed to read key_auth body from {}: {}", id, e);
+                return None;
+            }
+        };
+        body.to_vec()
+    };
+
+    if !key_auth.is_empty() {
+        // Register so run_alpn_listener can proxy LE's port-443 connections to this client
+        pending.insert(id.to_string(), PendingAlpnConn::H2(sender.clone()));
+        // Long-poll GET /_ctrl/done — client holds the response until ACME finalize completes,
+        // while concurrently handling /_ctrl/alpn challenge streams from run_alpn_listener.
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/_ctrl/done")
+            .body(())
+            .unwrap();
+        let (resp_future, _) = match sender.send_request(req, true) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("H2: failed to send /_ctrl/done for {}: {}", id, e);
+                pending.remove(id);
+                return None;
+            }
+        };
+        if let Err(e) = resp_future.await {
+            error!("H2: /_ctrl/done response failed for {}: {}", id, e);
+        }
+        pending.remove(id);
+    }
+
+    Some(())
+}

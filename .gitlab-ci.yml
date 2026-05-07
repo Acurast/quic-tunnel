@@ -1,0 +1,13 @@
+include:
+  - project: "papers/papers-internal/internal"
+    file: "/.base-gitlab-ci.yml"
+
+stages:
+  - build
+
+build:
+  stage: build
+  script:
+    - docker build --target build -t $GOOGLE_TAG .
+  tags:
+    - docker

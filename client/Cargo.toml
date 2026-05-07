@@ -1,0 +1,19 @@
+[package]
+name = "client"
+authors = { workspace = true }
+version = { workspace = true }
+edition = { workspace = true }
+
+[[bin]]
+name = "client"
+path = "src/main.rs"
+
+[dependencies]
+tunnel-client = { workspace = true }
+tokio = { workspace = true }
+rcgen = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+hex = { workspace = true }
