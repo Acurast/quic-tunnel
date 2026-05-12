@@ -8,13 +8,13 @@ plugins {
 }
 
 object Library {
-    const val groupId = "com.acurast.tunnel"
-    const val artifactId = "tunnel-client"
-    const val version = "1.2.0"
+    const val groupId = "com.github.acurast"
+    const val artifactId = "quic-tunnel"
+    const val version = "0.1.1"
 }
 
 android {
-    namespace = Library.groupId
+    namespace = "com.acurast.tunnel"
     compileSdk = 35
     ndkVersion = sdkDirectory.resolve("ndk").listFilesOrdered().last().name
 
@@ -76,6 +76,10 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     compileOnly(libs.jna)
     implementation(libs.kotlinx.coroutines.core)
+    // Android sidecar required by `rustls-platform-verifier` (transitively used
+    // by `instant-acme` and `quinn` for TLS verification). The crate version
+    // must match the Rust dep version.
+    implementation("rustls:rustls-platform-verifier:0.1.1")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

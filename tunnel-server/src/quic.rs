@@ -1,11 +1,11 @@
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tunnel_common::{ctrl_read, ctrl_write};
 
 use crate::util::{
-    allowed_suffix, compute_txt_expected, custom_data_from_cert, id_from_cert, pubkey_from_cert,
-    register,
+    allowed_suffix, compute_txt_expected, custom_data_from_cert, pubkey_from_cert,
+    recover_identity_pubkey, register,
 };
 use crate::{Agent, AgentMap, AuthHandler, PendingAlpnConn, PendingAlpnMap};
 
@@ -51,16 +51,9 @@ async fn handle_quic_connection(
     let peer_certs: Vec<rustls::pki_types::CertificateDer> =
         *conn.peer_identity()?.downcast().ok()?;
     let first_cert = peer_certs.first()?.as_ref();
-    let id = match id_from_cert(first_cert) {
-        Some(id) => id,
-        None => {
-            warn!("QUIC: could not derive client_id from {}", remote);
-            return None;
-        }
-    };
     let custom_data = custom_data_from_cert(first_cert);
     if let Some(ref att) = custom_data {
-        info!("QUIC: client_id={} custom data ({} bytes)", id, att.len());
+        debug!("QUIC: {} custom data ({} bytes)", remote, att.len());
     }
     let auth_token: Option<Vec<u8>> = if let Some(ref handler) = auth_handler {
         let pubkey = match pubkey_from_cert(first_cert) {
@@ -74,7 +67,7 @@ async fn handle_quic_connection(
         match handler(&pubkey, custom_data.as_deref()) {
             Ok(token) => token,
             Err(e) => {
-                warn!("QUIC: auth denied for client_id={} ({}): {}", id, remote, e);
+                warn!("QUIC: auth denied for {}: {}", remote, e);
                 conn.close(quinn::VarInt::from_u32(1), b"");
                 return None;
             }
@@ -82,24 +75,21 @@ async fn handle_quic_connection(
     } else {
         None
     };
-    debug!(
-        "QUIC: client_id={} ({}), starting control exchange",
-        id, remote
-    );
+    debug!("QUIC: {} starting control exchange", remote);
 
     let (mut ctrl_send, mut ctrl_recv) = match conn.accept_bi().await {
         Ok(s) => s,
         Err(e) => {
-            error!("QUIC: failed to accept control stream from {}: {}", id, e);
+            error!("QUIC: failed to accept control stream from {}: {}", remote, e);
             return None;
         }
     };
 
-    quic_ctrl_exchange(
+    let id = quic_ctrl_exchange(
         &conn,
         &mut ctrl_send,
         &mut ctrl_recv,
-        &id,
+        remote,
         &pending,
         &domain_suffixes,
         auth_token,
@@ -123,31 +113,54 @@ async fn quic_ctrl_exchange(
     conn: &quinn::Connection,
     ctrl_send: &mut quinn::SendStream,
     ctrl_recv: &mut quinn::RecvStream,
-    id: &str,
+    remote: SocketAddr,
     pending: &PendingAlpnMap,
     domain_suffixes: &[String],
     auth_token: Option<Vec<u8>>,
     resolver: &hickory_resolver::TokioAsyncResolver,
-) -> Option<()> {
+) -> Option<String> {
     // Step 1: read domain from client
     let domain_bytes = match ctrl_read(ctrl_recv).await {
         Ok(d) => d,
         Err(e) => {
-            error!("QUIC: failed to read domain from {}: {}", id, e);
+            error!("QUIC: failed to read domain from {}: {}", remote, e);
             return None;
         }
     };
     let domain = match std::str::from_utf8(&domain_bytes) {
         Ok(d) => d.to_string(),
         Err(e) => {
-            error!("QUIC: invalid domain from {}: {}", id, e);
+            error!("QUIC: invalid domain from {}: {}", remote, e);
             return None;
         }
     };
-    if domain.split('.').next() != Some(id) {
-        error!("QUIC: domain {} does not match client_id {}", domain, id);
-        return None;
-    }
+
+    // Step 2: read identity signature over the domain (P-256 recoverable, 65 bytes)
+    let sig_bytes = match ctrl_read(ctrl_recv).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("QUIC: failed to read identity signature from {}: {}", remote, e);
+            return None;
+        }
+    };
+    let pubkey = match recover_identity_pubkey(&domain, &sig_bytes) {
+        Some(pk) => pk,
+        None => {
+            error!(
+                "QUIC: identity signature does not bind to id in domain {} from {}",
+                domain, remote
+            );
+            return None;
+        }
+    };
+    let id = domain.split('.').next()?.to_string();
+    debug!(
+        "QUIC: {} id={} recovered identity pubkey ({} bytes)",
+        remote,
+        id,
+        pubkey.len()
+    );
+
     if !allowed_suffix(&domain, domain_suffixes) {
         error!(
             "QUIC: domain {} has no allowed suffix (allowed: {:?})",
@@ -157,7 +170,7 @@ async fn quic_ctrl_exchange(
     }
     debug!("QUIC: domain={}", domain);
 
-    // Step 1b: DNS TXT validation (only when auth_handler returned a deployment_source)
+    // Step 2b: DNS TXT validation (only when auth_handler returned a deployment_source)
     if let Some(ref deployment_source) = auth_token {
         let host = domain.split_once('.').map(|x| x.1).unwrap_or("");
         let txt_name = format!("_acu.{}.", host);
@@ -184,7 +197,7 @@ async fn quic_ctrl_exchange(
         }
     }
 
-    // Step 2: read key_auth — empty means cert is cached, non-empty means ACME challenge in progress
+    // Step 3: read key_auth — empty means cert is cached, non-empty means ACME challenge in progress
     let key_auth = match ctrl_read(ctrl_recv).await {
         Ok(k) => k,
         Err(e) => {
@@ -195,19 +208,19 @@ async fn quic_ctrl_exchange(
 
     if !key_auth.is_empty() {
         // Register this connection so run_alpn_listener can proxy LE's port-443 connections
-        pending.insert(id.to_string(), PendingAlpnConn::Quic(conn.clone()));
+        pending.insert(id.clone(), PendingAlpnConn::Quic(conn.clone()));
         // ACK so client knows it can start handling ALPN challenge streams
         if let Err(e) = ctrl_write(ctrl_send, b"ack").await {
             error!("QUIC: failed to send ACK to {}: {}", id, e);
-            pending.remove(id);
+            pending.remove(&id);
             return None;
         }
         // Wait for client to signal ACME finalize is complete
         if let Err(e) = ctrl_read(ctrl_recv).await {
             error!("QUIC: failed to read done signal from {}: {}", id, e);
         }
-        pending.remove(id);
+        pending.remove(&id);
     }
 
-    Some(())
+    Some(id)
 }

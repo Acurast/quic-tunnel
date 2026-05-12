@@ -34,3 +34,4 @@ x509-parser = { workspace = true }
 yasna = { workspace = true }
 base64 = { workspace = true }
 hickory-resolver = { workspace = true }
+p256 = { workspace = true }

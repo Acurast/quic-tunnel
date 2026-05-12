@@ -3,7 +3,7 @@ use clap::Parser;
 use log::info;
 use std::{path::Path, sync::Arc};
 use tunnel_client::key::KeyAlgorithm;
-use tunnel_client::{TunnelClient, TunnelConfig, TunnelConnectionConfig, TunnelKey};
+use tunnel_client::{TunnelClient, TunnelConfig, TunnelIdentityConfig, TunnelKey};
 
 #[derive(Parser)]
 struct Args {
@@ -113,8 +113,8 @@ async fn main() -> Result<()> {
         Some(path) => Some(load_or_generate_keypair(path)?),
         None => None,
     };
-    let primary_keypair: Arc<dyn TunnelKey> = Arc::new(LocalKey::from_der(primary_der)?);
-    let secondary_keypair: Option<Arc<dyn TunnelKey>> = match secondary_der {
+    let primary_identity: Arc<dyn TunnelKey> = Arc::new(LocalKey::from_der(primary_der)?);
+    let self_signed_identity: Option<Arc<dyn TunnelKey>> = match secondary_der {
         Some(der) => Some(Arc::new(LocalKey::from_der(der)?)),
         None => None,
     };
@@ -128,13 +128,13 @@ async fn main() -> Result<()> {
         .map(|h| hex::decode(&h))
         .transpose()?;
 
-    if secondary_keypair.is_none() && secondary_cert_extension.is_some() {
+    if self_signed_identity.is_none() && secondary_cert_extension.is_some() {
         log::warn!(
             "--secondary-cert-extension-hex ignored because --secondary-key was not provided"
         );
     }
 
-    let secondary = secondary_keypair.map(|keypair| TunnelConnectionConfig {
+    let self_signed_identity_config = self_signed_identity.map(|keypair| TunnelIdentityConfig {
         keypair,
         cert_extension: secondary_cert_extension,
     });
@@ -159,11 +159,11 @@ async fn main() -> Result<()> {
                 }
             }))
         },
-        primary: TunnelConnectionConfig {
-            keypair: primary_keypair,
+        primary_identity: TunnelIdentityConfig {
+            keypair: primary_identity,
             cert_extension: primary_cert_extension,
         },
-        secondary,
+        self_signed_identity: self_signed_identity_config,
     };
 
     let client = Arc::new(TunnelClient::new(config)?);

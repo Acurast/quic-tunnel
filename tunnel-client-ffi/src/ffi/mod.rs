@@ -8,11 +8,32 @@
 //! [`TunnelKey`] callback object (typically backed by Android Keystore).
 
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use tunnel_client as tc;
+
+/// Dedicated tokio runtime for driving foreign-side async sign callbacks.
+///
+/// `tc::TunnelKey::sign` is invoked synchronously by rustls/rcgen from two
+/// distinct contexts: (1) the uniffi constructor (no runtime entered), and
+/// (2) the uniffi async `run()` (already on a tokio worker). A foreign
+/// `async sign()` future therefore can't be driven via
+/// `Handle::current().block_on(...)` reliably. Using an isolated multi-threaded
+/// runtime + `spawn` + a sync channel sidesteps both the no-runtime case and
+/// the runtime-already-entered case.
+fn foreign_key_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("tunnel-foreign-key")
+            .build()
+            .expect("foreign key runtime")
+    })
+}
 
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyAlgorithm {
@@ -122,15 +143,18 @@ impl TunnelClient {
     ) -> Result<Arc<Self>, TunnelError> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let primary_local = LocalKey::from_primary(&config.primary.key)
-            .map_err(|e| TunnelError::InvalidConfig(e.to_string()))?;
-        let primary = tc::TunnelConnectionConfig {
+        let primary_local = LocalKey::from_primary(&config.primary.key).map_err(|e| {
+            let chain = format_error_chain(&e);
+            log::error!("TunnelClient::new primary key error: {chain}");
+            TunnelError::InvalidConfig(chain)
+        })?;
+        let primary = tc::TunnelIdentityConfig {
             keypair: Arc::new(primary_local),
             cert_extension: config.primary.cert_extension.clone(),
         };
 
         let secondary = match (config.secondary.clone(), secondary_key) {
-            (Some(sec_cfg), Some(sec_foreign)) => Some(tc::TunnelConnectionConfig {
+            (Some(sec_cfg), Some(sec_foreign)) => Some(tc::TunnelIdentityConfig {
                 keypair: Arc::new(ForeignKey::new(sec_foreign)),
                 cert_extension: sec_cfg.cert_extension,
             }),
@@ -158,12 +182,15 @@ impl TunnelClient {
             acme_staging: config.acme_staging,
             cert_pem: config.cert_pem,
             on_cert_issued: Some(on_cert_issued),
-            primary,
-            secondary,
+            primary_identity: primary,
+            self_signed_identity: secondary,
         };
 
-        let inner = tc::TunnelClient::new(inner_cfg)
-            .map_err(|e| TunnelError::InvalidConfig(e.to_string()))?;
+        let inner = tc::TunnelClient::new(inner_cfg).map_err(|e| {
+            let chain = format_error_chain(&e);
+            log::error!("TunnelClient::new failed: {chain}");
+            TunnelError::InvalidConfig(chain)
+        })?;
         let info = TunnelInfo {
             url: inner.url().to_string(),
             client_id: inner.client_id().to_string(),
@@ -188,10 +215,10 @@ impl TunnelClient {
         match inner.run().await {
             Ok(()) => self.handler.on_event(TunnelEvent::Stopped).await,
             Err(e) => {
+                let chain = format_error_chain(&e);
+                log::error!("tunnel run failed: {chain}");
                 self.handler
-                    .on_event(TunnelEvent::Failed {
-                        cause: e.to_string(),
-                    })
+                    .on_event(TunnelEvent::Failed { cause: chain })
                     .await
             }
         }
@@ -297,14 +324,31 @@ impl tc::TunnelKey for ForeignKey {
     fn sign(&self, msg: &[u8]) -> Result<Vec<u8>> {
         let foreign = Arc::clone(&self.foreign);
         let msg = msg.to_vec();
-        // rustls/rcgen drive sign() from a Tokio worker; block_in_place +
-        // Handle::current::block_on bridges back to the multi-threaded
-        // uniffi tokio runtime so the foreign suspend fun can run.
-        let sig = tokio::task::block_in_place(move || {
-            tokio::runtime::Handle::current().block_on(async move { foreign.sign(msg).await })
+        // The caller may be on a tokio worker (run() path) or on no runtime at
+        // all (constructor path during cert/CSR generation). Drive the foreign
+        // future on a dedicated runtime and block the calling thread on a sync
+        // channel — independent of any ambient tokio context.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        foreign_key_runtime().spawn(async move {
+            let sig = foreign.sign(msg).await;
+            let _ = tx.send(sig);
         });
-        Ok(sig)
+        rx.recv()
+            .map_err(|e| anyhow::anyhow!("foreign sign worker died: {e}"))
     }
+}
+
+/// Render an `anyhow::Error` plus its full source chain in a single string,
+/// suitable for crossing the FFI boundary and showing up in `adb logcat`.
+/// Format: `top: cause1: cause2: ...`.
+fn format_error_chain(err: &anyhow::Error) -> String {
+    let mut parts = err.chain().map(|c| c.to_string());
+    let mut out = parts.next().unwrap_or_default();
+    for cause in parts {
+        out.push_str(": ");
+        out.push_str(&cause);
+    }
+    out
 }
 
 /// Wraps a raw 32-byte Ed25519 seed in a PKCS#8 DER blob suitable for rcgen.
