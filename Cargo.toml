@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 authors = ["Papers AG"]
 repository = "https://github.com/acurast"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [workspace.dependencies]
