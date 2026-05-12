@@ -1,5 +1,6 @@
 use crate::acme::{CertProvisioner, PrepareResult};
-use crate::key::{RcgenRemoteKey, RustlsRemoteKey, TunnelKey};
+use crate::key::{KeyAlgorithm, RcgenRemoteKey, RustlsRemoteKey, TunnelKey};
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use rustls::pki_types::CertificateDer;
@@ -13,7 +14,6 @@ use std::{
     time::Duration,
 };
 
-use rustls_native_certs;
 use tokio::{net::TcpStream, sync::Notify};
 use tunnel_common::{
     build_alpn_acceptor, ctrl_read, ctrl_write, H2Recv, H2Send, NoVerify, CUSTOM_DATA_EXT_OID, IO,
@@ -22,7 +22,7 @@ use tunnel_common::{
 /// Per-connection identity: the signing key and an optional custom X.509
 /// extension embedded in the self-signed agent certificate the server sees
 /// during mTLS.
-pub struct TunnelConnectionConfig {
+pub struct TunnelIdentityConfig {
     /// Signing key. The private key material stays behind the trait
     /// boundary; the client only calls `sign`.
     pub keypair: Arc<dyn TunnelKey>,
@@ -46,12 +46,12 @@ pub struct TunnelConfig {
     /// Called with the cert PEM when a new cert is freshly issued via ACME.
     pub on_cert_issued: Option<Arc<dyn Fn(String) + Send + Sync>>,
     /// Primary connection identity. Drives the ACME-issued tunnel cert.
-    pub primary: TunnelConnectionConfig,
-    /// Optional secondary connection. When present, the client opens a
-    /// second connection per server address using this identity; that
-    /// connection uses a plain self-signed cert to terminate tunnel TLS
-    /// (no ACME).
-    pub secondary: Option<TunnelConnectionConfig>,
+    pub primary_identity: TunnelIdentityConfig,
+    /// Optional self-signed connection identity. When present, the client
+    /// opens a second connection per server address using this identity;
+    /// that connection uses a plain self-signed cert to terminate tunnel
+    /// TLS (no ACME).
+    pub self_signed_identity: Option<TunnelIdentityConfig>,
 }
 
 pub struct TunnelClient {
@@ -66,15 +66,19 @@ struct Connection {
     client_id: String,
     domain: String,
     url: String,
-    /// Self-signed cert presented during mTLS to the server. The server derives
-    /// `client_id` from its embedded pubkey. On the secondary connection this
-    /// cert is also reused to terminate user-facing tunnel TLS.
+    /// Self-signed cert presented during mTLS to the server. Signed by
+    /// `agent_keypair`. On the secondary connection this cert is also reused
+    /// to terminate user-facing tunnel TLS.
     agent_cert_der: Vec<u8>,
-    /// Keypair driving all signing for this connection (agent cert, optional
-    /// CSR, TLS handshakes for mTLS and user-facing termination).
-    keypair: Arc<dyn TunnelKey>,
+    /// Keypair signing the mTLS agent cert and driving TLS handshakes
+    /// (client auth + secondary user TLS termination).
+    agent_keypair: Arc<dyn TunnelKey>,
+    /// Keypair whose pubkey derives `client_id` and signs the domain
+    /// proof-of-possession sent to the server. Also signs the ACME CSR on
+    /// the primary connection. Must be ECDSA P-256.
+    identity_keypair: Arc<dyn TunnelKey>,
     /// CSR used to request an ACME-issued tunnel cert. Present only on the
-    /// primary connection.
+    /// primary connection. Signed by `identity_keypair`.
     csr_der: Option<Vec<u8>>,
 }
 
@@ -86,14 +90,39 @@ impl TunnelClient {
         // transitive deps, leaving no auto-detected default. Install ring explicitly;
         // ignore Err (already installed by another caller).
         let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // The identity-recovery protocol requires P-256 on both keypairs (server
+        // recovers the pubkey from a recoverable ECDSA signature).
+        if config.primary_identity.keypair.algorithm() != crate::key::KeyAlgorithm::EcdsaP256 {
+            anyhow::bail!("primary_identity keypair must be ECDSA P-256");
+        }
+        if let Some(sec) = &config.self_signed_identity {
+            if sec.keypair.algorithm() != crate::key::KeyAlgorithm::EcdsaP256 {
+                anyhow::bail!("self_signed_identity keypair must be ECDSA P-256");
+            }
+        }
+
+        // Primary connection: identity = primary_identity (drives id, ACME CSR,
+        // domain signature). Agent cert is signed by self_signed_identity when
+        // configured, otherwise by primary_identity.
+        let primary_agent_keypair = match &config.self_signed_identity {
+            Some(sec) => Arc::clone(&sec.keypair),
+            None => Arc::clone(&config.primary_identity.keypair),
+        };
         let primary = build_connection(
-            Arc::clone(&config.primary.keypair),
+            primary_agent_keypair,
+            Arc::clone(&config.primary_identity.keypair),
             &config.domain_suffix,
-            config.primary.cert_extension.as_deref(),
+            config.primary_identity.cert_extension.as_deref(),
             /* need_csr */ true,
         )?;
-        let secondary = match &config.secondary {
+        // Secondary connection: only exists when self_signed_identity is
+        // configured. Both the agent cert and the identity (id derivation +
+        // domain signature) are bound to self_signed_identity, so the secondary
+        // gets a distinct client_id from the primary and routes to its own URL.
+        let secondary = match &config.self_signed_identity {
             Some(sec) => Some(build_connection(
+                Arc::clone(&sec.keypair),
                 Arc::clone(&sec.keypair),
                 &config.domain_suffix,
                 sec.cert_extension.as_deref(),
@@ -250,7 +279,14 @@ impl TunnelClient {
         // Step 1: send domain
         ctrl_write(&mut ctrl_send, conn_m.domain.as_bytes()).await?;
 
-        // Step 2: obtain the tunnel-terminating cert material.
+        // Step 2: send recoverable ECDSA P-256 signature over the domain so the
+        // server can recover the identity pubkey and verify it hashes to the id
+        // portion of the domain.
+        let sig = sign_recoverable(conn_m.identity_keypair.as_ref(), conn_m.domain.as_bytes())?;
+        ctrl_write(&mut ctrl_send, &sig).await?;
+
+        // Step 3: obtain the tunnel-terminating cert material.
+        let provisioner_was_some = provisioner.is_some();
         let tunnel_certs: Vec<CertificateDer<'static>> = match provisioner {
             None => {
                 // No ACME on this connection: send empty key_auth; reuse agent
@@ -318,7 +354,15 @@ impl TunnelClient {
             tag, server_addr, conn_m.url
         );
 
-        let acceptor = build_tls_acceptor(Arc::clone(&conn_m.keypair), tunnel_certs)?;
+        // User-TLS keypair must match the cert chain: on the ACME path the
+        // chain belongs to the identity key (CSR was signed by it); without
+        // ACME we reuse the agent cert + agent key.
+        let user_tls_keypair = if provisioner_was_some {
+            Arc::clone(&conn_m.identity_keypair)
+        } else {
+            Arc::clone(&conn_m.agent_keypair)
+        };
+        let acceptor = build_tls_acceptor(user_tls_keypair, tunnel_certs)?;
         let local_addr = self.config.local_addr.clone();
 
         loop {
@@ -354,7 +398,8 @@ impl TunnelClient {
                 let server_addr = server_addr.to_string();
                 let local_addr = self.config.local_addr.clone();
                 let agent_cert_der = conn_m.agent_cert_der.clone();
-                let keypair = Arc::clone(&conn_m.keypair);
+                let agent_keypair = Arc::clone(&conn_m.agent_keypair);
+                let identity_keypair = Arc::clone(&conn_m.identity_keypair);
                 let csr_der = conn_m.csr_der.clone();
                 let url = conn_m.url.clone();
                 let domain = conn_m.domain.clone();
@@ -366,8 +411,13 @@ impl TunnelClient {
                     loop {
                         debug!("H2[{}/{}]: connecting to {}", tag, i, server_addr);
                         let cert: CertificateDer<'static> = agent_cert_der.clone().into();
-                        match connect_h2(&server_addr, cert, Arc::clone(&keypair), acme_staging)
-                            .await
+                        match connect_h2(
+                            &server_addr,
+                            cert,
+                            Arc::clone(&agent_keypair),
+                            acme_staging,
+                        )
+                        .await
                         {
                             Err(e) => {
                                 error!("H2[{}/{}]: connection failed: {}", tag, i, e);
@@ -378,18 +428,25 @@ impl TunnelClient {
                                 let ctrl_res = h2_ctrl_exchange(
                                     &mut h2,
                                     &domain,
+                                    identity_keypair.as_ref(),
                                     csr_der.as_deref(),
                                     provisioner.clone(),
                                     &agent_cert_der,
                                 )
                                 .await;
+                                let provisioner_was_some = provisioner.is_some();
                                 match ctrl_res {
                                     Err(e) => {
                                         error!("H2[{}/{}]: control exchange failed: {}", tag, i, e);
                                     }
                                         Ok(tunnel_certs) => {
                                         info!("H2[{}/{}]: tunnel ready at {}", tag, i, url);
-                                        match build_tls_acceptor(Arc::clone(&keypair), tunnel_certs) {
+                                        let user_tls_keypair = if provisioner_was_some {
+                                            Arc::clone(&identity_keypair)
+                                        } else {
+                                            Arc::clone(&agent_keypair)
+                                        };
+                                        match build_tls_acceptor(user_tls_keypair, tunnel_certs) {
                                             Err(e) => {
                                                 error!("H2[{}/{}]: failed to build TLS acceptor: {}", tag, i, e);
                                             }
@@ -441,7 +498,7 @@ impl TunnelClient {
         connect_quic(
             server_addr,
             cert,
-            Arc::clone(&conn_m.keypair),
+            Arc::clone(&conn_m.agent_keypair),
             self.config.acme_staging,
         )
         .await
@@ -491,20 +548,44 @@ fn parse_cert_chain_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
         .collect::<Result<_, _>>()?)
 }
 
-/// Builds a `Connection` from a remote-signing keypair. When `need_csr` is
-/// true, a CSR is generated for ACME; otherwise it's left `None`.
+/// Builds a `Connection` with split agent/identity roles.
+///
+/// `agent_keypair` signs the self-signed mTLS agent cert and drives TLS
+/// handshakes. `identity_keypair` (must be P-256) derives `client_id` from
+/// its pubkey and signs the ACME CSR when `need_csr` is true.
 fn build_connection(
-    keypair: Arc<dyn TunnelKey>,
+    agent_keypair: Arc<dyn TunnelKey>,
+    identity_keypair: Arc<dyn TunnelKey>,
     domain_suffix: &str,
     cert_extension: Option<&[u8]>,
     need_csr: bool,
 ) -> Result<Connection> {
-    let raw_pub = keypair.public_key_raw();
-    let client_id = hex::encode(&Sha256::digest(&raw_pub)[0..8]);
+    let identity_pub_raw = identity_keypair.public_key_raw();
+    // Hash the SEC1-COMPRESSED point (33 bytes: 0x02/0x03 || X) for P-256, not
+    // the uncompressed 65-byte form, so client_id matches the Acurast on-chain
+    // pubkey hash convention (Substrate ecdsa::Public is compressed-33).
+    // public_key_raw() still returns uncompressed because rcgen / rustls /
+    // X.509 SPKI for P-256 all want the uncompressed point.
+    let id_bytes: Vec<u8> = match identity_keypair.algorithm() {
+        KeyAlgorithm::Ed25519 => {
+            anyhow::ensure!(
+                identity_pub_raw.len() == 32,
+                "Ed25519 identity public_key_raw() returned {} bytes (expected 32)",
+                identity_pub_raw.len(),
+            );
+            identity_pub_raw.clone()
+        }
+        KeyAlgorithm::EcdsaP256 => {
+            let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&identity_pub_raw)
+                .map_err(|e| anyhow::anyhow!("parse identity pubkey for client_id: {e}"))?;
+            vk.to_encoded_point(true).as_bytes().to_vec()
+        }
+    };
+    let client_id = hex::encode(&Sha256::digest(&id_bytes)[0..8]);
     let domain = format!("{}.{}", client_id, domain_suffix);
     let url = format!("https://{}:8443", domain);
 
-    let rcgen_key = RcgenRemoteKey::new(Arc::clone(&keypair));
+    let agent_rcgen_key = RcgenRemoteKey::new(Arc::clone(&agent_keypair));
 
     let mut params = rcgen::CertificateParams::new(vec!["agent".into()])?;
     if let Some(ext_bytes) = cert_extension {
@@ -516,9 +597,10 @@ fn build_connection(
             content,
         )];
     }
-    let agent_cert_der = params.self_signed(&rcgen_key)?.der().to_vec();
+    let agent_cert_der = params.self_signed(&agent_rcgen_key)?.der().to_vec();
 
     let csr_der = if need_csr {
+        let identity_rcgen_key = RcgenRemoteKey::new(Arc::clone(&identity_keypair));
         let mut csr_params = rcgen::CertificateParams::new(vec![domain.clone()])?;
         csr_params.distinguished_name = rcgen::DistinguishedName::new();
         csr_params
@@ -526,7 +608,7 @@ fn build_connection(
             .push(rcgen::DnType::CommonName, domain.clone());
         Some(
             csr_params
-                .serialize_request(&rcgen_key)?
+                .serialize_request(&identity_rcgen_key)?
                 .der()
                 .as_ref()
                 .to_vec(),
@@ -540,14 +622,38 @@ fn build_connection(
         domain,
         url,
         agent_cert_der,
-        keypair,
+        agent_keypair,
+        identity_keypair,
         csr_der,
     })
+}
+
+/// Sign a message with `identity_keypair` and produce a 65-byte recoverable
+/// ECDSA P-256 signature (`r || s || v`). The signer's pubkey is encoded
+/// SEC1-uncompressed (matches `keypair.public_key_raw()` for P-256), used
+/// for the trial-recovery step to pin the correct recovery id.
+fn sign_recoverable(identity_keypair: &dyn TunnelKey, msg: &[u8]) -> Result<[u8; 65]> {
+    use p256::ecdsa::{Signature, VerifyingKey, recoverable};
+    let der = identity_keypair.sign(msg)?;
+    let sig = Signature::from_der(&der)
+        .map_err(|e| anyhow::anyhow!("parse identity signature DER: {e}"))?;
+    let vk = VerifyingKey::from_sec1_bytes(&identity_keypair.public_key_raw())
+        .map_err(|e| anyhow::anyhow!("identity pubkey: {e}"))?;
+    let rec = recoverable::Signature::from_trial_recovery(&vk, msg, &sig)
+        .map_err(|e| anyhow::anyhow!("trial-recovery for identity signature: {e}"))?;
+    let bytes: &[u8] = rec.as_ref();
+    let mut out = [0u8; 65];
+    if bytes.len() != 65 {
+        anyhow::bail!("recoverable signature length {} (expected 65)", bytes.len());
+    }
+    out.copy_from_slice(bytes);
+    Ok(out)
 }
 
 async fn h2_ctrl_exchange(
     h2_conn: &mut h2::server::Connection<tokio_rustls::client::TlsStream<TcpStream>, bytes::Bytes>,
     domain: &str,
+    identity_keypair: &dyn TunnelKey,
     csr_der: Option<&[u8]>,
     provisioner: Option<Arc<CertProvisioner>>,
     agent_cert_der: &[u8],
@@ -561,7 +667,18 @@ async fn h2_ctrl_exchange(
     let mut send = resp.send_response(http::Response::new(()), false)?;
     send.send_data(bytes::Bytes::from(domain.as_bytes().to_vec()), true)?;
 
-    // Step 2: GET /_ctrl/key_auth — run ACME prepare, respond with key_auth
+    // Step 2: GET /_ctrl/sig — respond with 65-byte recoverable ECDSA P-256
+    // signature over the domain so the server can recover the identity pubkey.
+    let (req, mut resp) = h2_conn
+        .accept()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("closed before /_ctrl/sig"))??;
+    anyhow::ensure!(req.uri().path() == "/_ctrl/sig");
+    let sig = sign_recoverable(identity_keypair, domain.as_bytes())?;
+    let mut send = resp.send_response(http::Response::new(()), false)?;
+    send.send_data(bytes::Bytes::copy_from_slice(&sig), true)?;
+
+    // Step 3: GET /_ctrl/key_auth — run ACME prepare, respond with key_auth
     let (req, mut resp) = h2_conn
         .accept()
         .await
@@ -689,10 +806,14 @@ fn ca_roots_client_config(
     keypair: Arc<dyn TunnelKey>,
     acme_staging: bool,
 ) -> Result<rustls::ClientConfig> {
+    // Mozilla CA bundle (`webpki-roots`). Android's `rustls-native-certs`
+    // can't reliably load the system trust store on all OS versions — ISRG
+    // Root X1 ends up missing on stock-relay devices, causing
+    // `invalid peer certificate: UnknownIssuer` for Let's Encrypt-signed
+    // relay certs. The Mozilla bundle is pinned at compile time and matches
+    // the ACME HTTPS path in `acme.rs`.
     let mut roots = rustls::RootCertStore::empty();
-    for c in rustls_native_certs::load_native_certs().certs {
-        roots.add(c).ok();
-    }
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     if acme_staging {
         for c in parse_cert_chain_pem(LE_STAGING_ROOTS_PEM)? {
             roots.add(c).ok();

@@ -1,5 +1,6 @@
 package com.acurast.tunnel
 
+import android.content.Context
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -65,6 +66,22 @@ public class TunnelClient internal constructor(
         companion object {
             private const val BUFFER_CAPACITY = 64
         }
+    }
+
+    public companion object {
+        init {
+            System.loadLibrary("tunnel_client_ffi")
+        }
+
+        /**
+         * Initializes `rustls-platform-verifier` with the host app's [Context].
+         * Must be called once before constructing any [TunnelClient]. Both the
+         * Let's Encrypt HTTPS client and the QUIC relay TLS layer drive
+         * certificate verification through Android's platform store, which
+         * requires the JVM context.
+         */
+        @JvmStatic
+        public external fun initAndroid(context: Context)
     }
 }
 

@@ -110,10 +110,12 @@ User                    Server                    Client                Local
 
 ## TLS / Certificate Model
 
-Two independent ACME flows:
+Two independent ACME flows, used at three different listeners:
 
-- **Server cert** — covers the relay's public port (`:8443`) and ALPN/API listeners. Provisioned via TLS-ALPN-01 (`:443` must be reachable from the public internet) when `--acme-domain` is set; otherwise loaded from a `--tls-cert` PEM, or self-signed if neither is provided.
-- **Per-client cert** — each tunnel client provisions its own publicly trusted LE cert for `{client_id}.<domain-suffix>` via HTTP-01-style challenge proxied through the server. The client terminates user TLS itself using this cert.
+- **Server cert** — presented to **agents** on the API port (`:4433`, QUIC + H2). Also briefly presented on `:443` during the server's own TLS-ALPN-01 challenge while it provisions/renews its cert. Provisioned via TLS-ALPN-01 when `--acme-domain` is set (`:443` must be reachable from the public internet); otherwise loaded from a `--tls-cert` PEM, or self-signed if neither is provided.
+- **Per-client cert** — each tunnel client provisions its own publicly trusted LE cert for `{client_id}.<domain-suffix>` via TLS-ALPN-01 with the challenge proxied through the relay's `:443` listener. The client terminates user TLS itself using this cert.
+
+The **public port (`:8443`)** does not terminate TLS at the relay — it peeks the ClientHello, routes by SNI, and forwards raw TCP bytes through the tunnel; TLS is terminated at the client.
 
 Optional **secondary endpoint** per client (`--secondary-key`) opens a second connection that terminates user TLS with a self-signed cert (no ACME).
 

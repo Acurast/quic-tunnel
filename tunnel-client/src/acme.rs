@@ -223,7 +223,11 @@ async fn load_or_create_account(email: Option<&str>, staging: bool, path: &str) 
     if Path::new(path).exists() {
         let json = tokio::fs::read_to_string(path).await?;
         let creds: AccountCredentials = serde_json::from_str(&json)?;
-        return Ok(Account::builder()?.from_credentials(creds).await?);
+        return Ok(
+            Account::builder_with_http(make_acme_http_client())
+                .from_credentials(creds)
+                .await?,
+        );
     }
 
     let contact = email.map(|e| format!("mailto:{}", e));
@@ -233,7 +237,7 @@ async fn load_or_create_account(email: Option<&str>, staging: bool, path: &str) 
     } else {
         LetsEncrypt::Production.url().to_owned()
     };
-    let (account, credentials) = Account::builder()?
+    let (account, credentials) = Account::builder_with_http(make_acme_http_client())
         .create(
             &NewAccount {
                 contact: &contact_refs,
@@ -247,4 +251,30 @@ async fn load_or_create_account(email: Option<&str>, staging: bool, path: &str) 
 
     tokio::fs::write(path, serde_json::to_string_pretty(&credentials)?).await?;
     Ok(account)
+}
+
+/// Builds an HTTP client for the ACME flow that uses the Mozilla CA bundle
+/// (`webpki-roots`) and does NOT perform OS-level revocation checking.
+///
+/// `rustls-platform-verifier` (the default trust path in `hyper-rustls`) on
+/// Android maps LE's CRL-only revocation cert profile to `Revoked` because the
+/// Kotlin sidecar's PKIX configuration doesn't fall back to CRL when an OCSP
+/// responder URL is missing. Trading revocation enforcement for connectivity
+/// here is acceptable: LE end-entity certs are short-lived, the relay TLS path
+/// is independently validated against the OS native trust store, and the ACME
+/// HTTPS surface is narrow (one host, one CA chain).
+fn make_acme_http_client() -> Box<dyn instant_acme::HttpClient> {
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_only()
+        .enable_http1()
+        .enable_http2()
+        .build();
+
+    let client = hyper_util::client::legacy::Client::builder(
+        hyper_util::rt::TokioExecutor::new(),
+    )
+    .build(connector);
+
+    Box::new(client)
 }
