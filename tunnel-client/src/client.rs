@@ -19,6 +19,15 @@ use tunnel_common::{
     build_alpn_acceptor, ctrl_read, ctrl_write, H2Recv, H2Send, NoVerify, CUSTOM_DATA_EXT_OID, IO,
 };
 
+/// Maximum number of consecutive failed reconnect attempts before the
+/// per-connection task gives up and returns an error. The counter resets
+/// after a connection successfully completes the control exchange.
+const RECONNECT_MAX_ATTEMPTS: u32 = 5;
+/// First backoff interval; doubles after each failed attempt, capped at
+/// [`RECONNECT_MAX_BACKOFF`]. Sequence: 2s, 4s, 8s, 16s, 32s, then bail.
+const RECONNECT_BASE_BACKOFF: Duration = Duration::from_secs(2);
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(32);
+
 /// Per-connection identity: the signing key and an optional custom X.509
 /// extension embedded in the self-signed agent certificate the server sees
 /// during mTLS.
@@ -234,8 +243,16 @@ impl TunnelClient {
         provisioner: Option<Arc<CertProvisioner>>,
         tag: &str,
     ) -> Result<()> {
+        let mut attempts: u32 = 0;
+        let mut backoff = RECONNECT_BASE_BACKOFF;
         while !self.stopped.load(Ordering::SeqCst) {
-            info!("QUIC[{}]: connecting to {}", tag, server_addr);
+            info!(
+                "QUIC[{}/{}]: connecting (attempt {}/{})",
+                tag,
+                server_addr,
+                attempts + 1,
+                RECONNECT_MAX_ATTEMPTS
+            );
             match self.quic_connect(conn_m, server_addr).await {
                 Err(e) => {
                     warn!(
@@ -246,8 +263,16 @@ impl TunnelClient {
                 }
                 Ok(conn) => {
                     info!("QUIC[{}/{}]: connected", tag, server_addr);
+                    let ctrl_completed = Arc::new(AtomicBool::new(false));
                     if let Err(e) = self
-                        .quic_loop(conn_m, conn, server_addr, provisioner.clone(), tag)
+                        .quic_loop(
+                            conn_m,
+                            conn,
+                            server_addr,
+                            provisioner.clone(),
+                            tag,
+                            Arc::clone(&ctrl_completed),
+                        )
                         .await
                     {
                         warn!("QUIC[{}/{}]: error ({})", tag, server_addr, e);
@@ -255,11 +280,33 @@ impl TunnelClient {
                     if self.stopped.load(Ordering::SeqCst) {
                         return Ok(());
                     }
-                    info!("QUIC[{}/{}]: reconnecting in 2s", tag, server_addr);
+                    if ctrl_completed.load(Ordering::SeqCst) {
+                        attempts = 0;
+                        backoff = RECONNECT_BASE_BACKOFF;
+                    } else {
+                        attempts += 1;
+                        if attempts >= RECONNECT_MAX_ATTEMPTS {
+                            anyhow::bail!(
+                                "QUIC[{}/{}]: giving up after {} failed attempts",
+                                tag,
+                                server_addr,
+                                attempts
+                            );
+                        }
+                    }
+                    info!(
+                        "QUIC[{}/{}]: reconnecting in {:?} (next attempt {}/{})",
+                        tag,
+                        server_addr,
+                        backoff,
+                        attempts + 1,
+                        RECONNECT_MAX_ATTEMPTS
+                    );
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                        _ = tokio::time::sleep(backoff) => {}
                         _ = self.stop.notified() => return Ok(()),
                     }
+                    backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
                 }
             }
         }
@@ -273,6 +320,7 @@ impl TunnelClient {
         server_addr: &str,
         provisioner: Option<Arc<CertProvisioner>>,
         tag: &str,
+        ctrl_completed: Arc<AtomicBool>,
     ) -> Result<()> {
         let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?;
 
@@ -301,9 +349,9 @@ impl TunnelClient {
                         ctrl_write(&mut ctrl_send, b"").await?;
                         pem
                     }
-                    PrepareResult::Challenge(alpn_pending) => {
+                    PrepareResult::LeaderChallenge(alpn_pending) => {
                         let ka = alpn_pending.key_authorization.clone();
-                        debug!("QUIC[{}]: building ALPN acceptor for challenge", tag);
+                        debug!("QUIC[{}]: leader, building ALPN acceptor for challenge", tag);
                         let alpn_acceptor = build_alpn_acceptor(&conn_m.domain, &ka)?;
 
                         // Send key_auth, wait for server ACK (server registers pending_alpn)
@@ -343,12 +391,63 @@ impl TunnelClient {
                         ctrl_write(&mut ctrl_send, b"done").await?;
                         cert_pem
                     }
+                    PrepareResult::FollowerChallenge {
+                        key_authorization,
+                        mut cert_rx,
+                    } => {
+                        let ka = key_authorization;
+                        debug!(
+                            "QUIC[{}]: follower, sharing leader's key_auth for ALPN challenge",
+                            tag
+                        );
+                        let alpn_acceptor = build_alpn_acceptor(&conn_m.domain, &ka)?;
+
+                        // Register pending on the server with the shared key_auth so
+                        // LE can land on this relay's IP and still validate.
+                        ctrl_write(&mut ctrl_send, ka.as_bytes()).await?;
+                        ctrl_read(&mut ctrl_recv).await?;
+
+                        // Serve ALPN challenge streams until the leader broadcasts
+                        // the issued cert (or the leader's order fails).
+                        let cert_pem = loop {
+                            tokio::select! {
+                                res = conn.accept_bi() => match res {
+                                    Ok((send, recv)) => {
+                                        debug!("QUIC[{}]: challenge stream received (follower), terminating TLS-ALPN-01", tag);
+                                        let acc = alpn_acceptor.clone();
+                                        tokio::spawn(async move {
+                                            let _ = acc.accept(IO::new(recv, send)).await;
+                                        });
+                                    }
+                                    Err(e) => return Err(e.into()),
+                                },
+                                res = cert_rx.changed() => {
+                                    res.map_err(|_| anyhow::anyhow!(
+                                        "ACME leader for {} dropped before cert issuance",
+                                        conn_m.domain
+                                    ))?;
+                                    let pem = cert_rx.borrow().clone().ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "ACME leader for {} signalled empty cert",
+                                            conn_m.domain
+                                        )
+                                    })?;
+                                    break pem;
+                                }
+                            }
+                        };
+
+                        // Signal done to server (server removes from pending_alpn)
+                        ctrl_write(&mut ctrl_send, b"done").await?;
+                        cert_pem
+                    }
                 };
                 parse_cert_chain_pem(&cert_pem)?
             }
         };
 
         drop((ctrl_send, ctrl_recv));
+        ctrl_completed.store(true, Ordering::SeqCst);
         info!(
             "QUIC[{}/{}]: tunnel ready at {}",
             tag, server_addr, conn_m.url
@@ -407,9 +506,16 @@ impl TunnelClient {
                 let tag = tag.to_string();
                 let acme_staging = self.config.acme_staging;
                 tokio::spawn(async move {
-                    let mut backoff = Duration::from_secs(1);
+                    let mut attempts: u32 = 0;
+                    let mut backoff = RECONNECT_BASE_BACKOFF;
                     loop {
-                        debug!("H2[{}/{}]: connecting to {}", tag, i, server_addr);
+                        debug!(
+                            "H2[{}/{}]: connecting (attempt {}/{})",
+                            tag,
+                            i,
+                            attempts + 1,
+                            RECONNECT_MAX_ATTEMPTS
+                        );
                         let cert: CertificateDer<'static> = agent_cert_der.clone().into();
                         match connect_h2(
                             &server_addr,
@@ -423,7 +529,6 @@ impl TunnelClient {
                                 error!("H2[{}/{}]: connection failed: {}", tag, i, e);
                             }
                             Ok(mut h2) => {
-                                backoff = Duration::from_secs(1);
                                 info!("H2[{}/{}]: connected", tag, i);
                                 let ctrl_res = h2_ctrl_exchange(
                                     &mut h2,
@@ -441,6 +546,9 @@ impl TunnelClient {
                                     }
                                         Ok(tunnel_certs) => {
                                         info!("H2[{}/{}]: tunnel ready at {}", tag, i, url);
+                                        // Successful ctrl exchange → reset retry budget.
+                                        attempts = 0;
+                                        backoff = RECONNECT_BASE_BACKOFF;
                                         let user_tls_keypair = if provisioner_was_some {
                                             Arc::clone(&identity_keypair)
                                         } else {
@@ -474,8 +582,24 @@ impl TunnelClient {
                                 }
                             }
                         }
+                        attempts += 1;
+                        if attempts >= RECONNECT_MAX_ATTEMPTS {
+                            error!(
+                                "H2[{}/{}]: giving up after {} failed attempts",
+                                tag, i, attempts
+                            );
+                            return;
+                        }
+                        debug!(
+                            "H2[{}/{}]: retrying in {:?} (next attempt {}/{})",
+                            tag,
+                            i,
+                            backoff,
+                            attempts + 1,
+                            RECONNECT_MAX_ATTEMPTS
+                        );
                         tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
                     }
                 })
             })
@@ -637,6 +761,12 @@ fn sign_recoverable(identity_keypair: &dyn TunnelKey, msg: &[u8]) -> Result<[u8;
     let der = identity_keypair.sign(msg)?;
     let sig = Signature::from_der(&der)
         .map_err(|e| anyhow::anyhow!("parse identity signature DER: {e}"))?;
+    // Trial-recovery only matches against the canonical low-s form. Android
+    // Keystore's `SHA256withECDSA` can emit high-s signatures, which DER-parse
+    // fine but won't recover to the expected pubkey. Normalize defensively;
+    // ring-backed signers (rcgen LocalKey) are already low-s, so this is a
+    // no-op there.
+    let sig = sig.normalize_s().unwrap_or(sig);
     let vk = VerifyingKey::from_sec1_bytes(&identity_keypair.public_key_raw())
         .map_err(|e| anyhow::anyhow!("identity pubkey: {e}"))?;
     let rec = recoverable::Signature::from_trial_recovery(&vk, msg, &sig)
@@ -700,9 +830,9 @@ async fn h2_ctrl_exchange(
             send.send_data(bytes::Bytes::new(), true)?;
             pem
         }
-        PrepareResult::Challenge(alpn_pending) => {
+        PrepareResult::LeaderChallenge(alpn_pending) => {
             let ka = alpn_pending.key_authorization.clone();
-            debug!("H2: building ALPN acceptor for challenge");
+            debug!("H2: leader, building ALPN acceptor for challenge");
             let alpn_acceptor = build_alpn_acceptor(domain, &ka)?;
 
             // Send key_auth in response body
@@ -760,6 +890,80 @@ async fn h2_ctrl_exchange(
                                 }
                                 result = &mut finalize_task => {
                                     break result??;
+                                }
+                            }
+                        };
+                        resp.send_response(http::Response::builder().status(200).body(())?, true)?;
+                        break cert_pem;
+                    }
+                    path => anyhow::bail!("unexpected ctrl path: {}", path),
+                }
+            }
+        }
+        PrepareResult::FollowerChallenge {
+            key_authorization,
+            mut cert_rx,
+        } => {
+            let ka = key_authorization;
+            debug!("H2: follower, sharing leader's key_auth for ALPN challenge");
+            let alpn_acceptor = build_alpn_acceptor(domain, &ka)?;
+
+            // Register pending on the server with the shared key_auth so LE
+            // can land on this relay's IP and still validate.
+            let mut send = resp.send_response(http::Response::new(()), false)?;
+            send.send_data(bytes::Bytes::from(ka.into_bytes()), true)?;
+
+            // Loop: handle /_ctrl/alpn streams and wait for /_ctrl/done; the
+            // leader's broadcast on `cert_rx` decides when we have the PEM.
+            loop {
+                let (req, mut resp) = h2_conn
+                    .accept()
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("connection closed during challenge"))??;
+                match req.uri().path() {
+                    "/_ctrl/alpn" => {
+                        debug!("H2: challenge stream received (follower), terminating TLS-ALPN-01");
+                        let send = resp.send_response(http::Response::new(()), false)?;
+                        let stream = IO::new(
+                            H2Recv {
+                                r: req.into_body(),
+                                buf: bytes::Bytes::new(),
+                            },
+                            H2Send(send),
+                        );
+                        let acc = alpn_acceptor.clone();
+                        tokio::spawn(async move {
+                            let _ = acc.accept(stream).await;
+                        });
+                    }
+                    "/_ctrl/done" => {
+                        let cert_pem = loop {
+                            tokio::select! {
+                                inner = h2_conn.accept() => {
+                                    if let Some(Ok((inner_req, mut inner_resp))) = inner {
+                                        if inner_req.uri().path() == "/_ctrl/alpn" {
+                                            let send = inner_resp.send_response(http::Response::new(()), false)?;
+                                            let stream = IO::new(
+                                                H2Recv { r: inner_req.into_body(), buf: bytes::Bytes::new() },
+                                                H2Send(send),
+                                            );
+                                            let acc = alpn_acceptor.clone();
+                                            tokio::spawn(async move { let _ = acc.accept(stream).await; });
+                                        }
+                                    }
+                                }
+                                res = cert_rx.changed() => {
+                                    res.map_err(|_| anyhow::anyhow!(
+                                        "ACME leader for {} dropped before cert issuance",
+                                        domain
+                                    ))?;
+                                    let pem = cert_rx.borrow().clone().ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "ACME leader for {} signalled empty cert",
+                                            domain
+                                        )
+                                    })?;
+                                    break pem;
                                 }
                             }
                         };

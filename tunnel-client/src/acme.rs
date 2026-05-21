@@ -16,15 +16,24 @@ pub struct AlpnPending {
     pub key_authorization: String,
     challenge_url: String,
     pub order: Order,
-    /// Broadcast the issued cert PEM to any concurrent callers waiting on this order.
+    /// Broadcast the issued cert PEM to any concurrent followers waiting on this order.
     tx: watch::Sender<Option<String>>,
 }
 
 pub enum PrepareResult {
     /// Cert is already cached — use it directly, no challenge needed.
     Cached(String),
-    /// ACME order started. Set up the ALPN proxy then call `finalize()`.
-    Challenge(AlpnPending),
+    /// This caller owns the LE order. Send `key_authorization` to the server,
+    /// run an ALPN acceptor, then call `finalize()`.
+    LeaderChallenge(AlpnPending),
+    /// Another caller owns the LE order. Send the shared `key_authorization`
+    /// to the server (so this relay's pending entry is registered), run an
+    /// ALPN acceptor (LE may pick this relay's IP), and await the cert PEM
+    /// on `cert_rx` instead of calling `finalize()`.
+    FollowerChallenge {
+        key_authorization: String,
+        cert_rx: watch::Receiver<Option<String>>,
+    },
 }
 
 struct CacheEntry {
@@ -32,12 +41,23 @@ struct CacheEntry {
     issued_at: Instant,
 }
 
+#[derive(Clone)]
+struct InFlightEntry {
+    /// `Some(key_auth)` once the leader has it from LE. Followers await this
+    /// before they can register pending on their relay with the same value.
+    key_auth_rx: watch::Receiver<Option<String>>,
+    /// `Some(pem)` once the leader's `finalize()` succeeds. Followers return
+    /// this PEM as their tunnel cert.
+    cert_rx: watch::Receiver<Option<String>>,
+}
+
 pub struct CertProvisioner {
     account: Account,
     cache: Mutex<HashMap<String, CacheEntry>>,
-    /// Tracks in-progress ACME orders. Value is a receiver that yields `Some(pem)`
-    /// when the order completes, or closes (sender dropped) on failure.
-    in_flight: Mutex<HashMap<String, watch::Receiver<Option<String>>>>,
+    /// Tracks in-progress ACME orders. Holds the watch receivers that drive
+    /// the leader/follower coordination across concurrent `prepare()` callers
+    /// for the same domain. The leader's senders live in [`AlpnPending`].
+    in_flight: Mutex<HashMap<String, InFlightEntry>>,
     on_cert_issued: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
@@ -68,14 +88,17 @@ impl CertProvisioner {
         );
     }
 
-    /// Phase 1: returns cached cert or starts an ACME TLS-ALPN-01 order.
-    /// If `Challenge` is returned, the caller must:
-    ///   1. Send `key_authorization` to the server.
-    ///   2. Handle incoming ALPN challenge streams from the server.
-    ///   3. Call `finalize()`.
+    /// Phase 1: returns a cached cert, becomes leader of a fresh LE order, or
+    /// joins as follower of an in-flight order. With multiple relay-connections
+    /// driving the same domain concurrently, only one caller becomes leader —
+    /// followers receive the SAME `key_authorization` so every relay registers
+    /// pending server-side with matching state. Whichever IP LE picks for the
+    /// TLS-ALPN-01 validator works.
     ///
-    /// Concurrent calls for the same domain while an order is in progress will
-    /// block until the first caller's `finalize()` completes, then return `Cached`.
+    /// Leader contract: send `key_authorization` to the server, run an ALPN
+    /// acceptor, then call `finalize()`.
+    /// Follower contract: send the shared `key_authorization` to the server,
+    /// run an ALPN acceptor, then await the cert PEM on `cert_rx`.
     pub async fn prepare(&self, domain: &str) -> Result<PrepareResult> {
         loop {
             // Fast path: cache hit (don't hold lock across the ACME I/O below)
@@ -88,71 +111,117 @@ impl CertProvisioner {
                 }
             }
 
-            // Check in_flight without holding the lock across network calls.
-            // If a stale entry is found (sender already dropped), remove it and retry.
+            // Check in_flight under the lock; if a leader exists, become a
+            // follower. Receivers are cloned so we can wait outside the lock.
+            let existing = {
+                let in_flight = self.in_flight.lock().await;
+                in_flight.get(domain).cloned()
+            };
+            if let Some(InFlightEntry {
+                mut key_auth_rx,
+                cert_rx,
+            }) = existing
             {
-                let maybe_rx = self.in_flight.lock().await.get(domain).cloned();
-                if let Some(mut rx) = maybe_rx {
-                    match rx.changed().await {
-                        Ok(_) => {
-                            let pem = rx.borrow().clone();
-                            return match pem {
-                                Some(pem) => Ok(PrepareResult::Cached(pem)),
-                                None => bail!("in-flight ACME order failed for {}", domain),
-                            };
+                // Fast path: leader has already published key_auth.
+                let cached = key_auth_rx.borrow().clone();
+                if let Some(key_authorization) = cached {
+                    return Ok(PrepareResult::FollowerChallenge {
+                        key_authorization,
+                        cert_rx,
+                    });
+                }
+                // Wait for the leader to publish key_auth. If the sender is
+                // dropped without publishing, the leader's LE setup failed —
+                // drop the stale entry and retry as a fresh leader.
+                match key_auth_rx.changed().await {
+                    Ok(_) => {
+                        let key_authorization = key_auth_rx.borrow().clone();
+                        match key_authorization {
+                            Some(key_authorization) => {
+                                return Ok(PrepareResult::FollowerChallenge {
+                                    key_authorization,
+                                    cert_rx,
+                                });
+                            }
+                            None => {
+                                // Shouldn't normally happen — leader sent None.
+                                // Treat as failure and retry.
+                                self.in_flight.lock().await.remove(domain);
+                                continue;
+                            }
                         }
-                        Err(_) => {
-                            // Sender was dropped (order failed/cancelled) — remove stale
-                            // entry and fall through to start a fresh order.
-                            self.in_flight.lock().await.remove(domain);
-                            continue;
-                        }
+                    }
+                    Err(_) => {
+                        self.in_flight.lock().await.remove(domain);
+                        continue;
                     }
                 }
             }
 
-            // No in_flight entry. Run the ACME network calls before inserting into the
-            // map so a failure never leaves a stale entry behind.
-            info!("ACME: provisioning cert for {}", domain);
-            let mut order = self
-                .account
-                .new_order(&NewOrder::new(&[Identifier::Dns(domain.to_string())]))
-                .await?;
-
-            let mut challenge_url = String::new();
-            let mut key_authorization = String::new();
-
-            let mut authorizations = order.authorizations();
-            while let Some(result) = authorizations.next().await {
-                let mut authz = result?;
-                if authz.status == AuthorizationStatus::Valid {
-                    continue;
-                }
-                let challenge = authz
-                    .challenge(ChallengeType::TlsAlpn01)
-                    .ok_or_else(|| anyhow::anyhow!("no TLS-ALPN-01 challenge for {}", domain))?;
-                key_authorization = challenge.key_authorization().as_str().to_string();
-                challenge_url = challenge.url.clone();
-            }
-
-            let (tx, rx) = watch::channel(None::<String>);
-
-            // Insert only after successful order setup. If another task raced us and
-            // already inserted an entry, loop back and wait for theirs.
+            // Claim leader by atomically inserting under the lock. Re-check to
+            // close the race window between the existing-entry probe and here.
+            let (key_auth_tx, key_auth_rx) = watch::channel(None::<String>);
+            let (cert_tx, cert_rx) = watch::channel(None::<String>);
             {
                 let mut in_flight = self.in_flight.lock().await;
                 if in_flight.contains_key(domain) {
+                    // Lost the race; retry the loop to become a follower.
                     continue;
                 }
-                in_flight.insert(domain.to_string(), rx);
+                in_flight.insert(
+                    domain.to_string(),
+                    InFlightEntry {
+                        key_auth_rx,
+                        cert_rx,
+                    },
+                );
             }
 
-            return Ok(PrepareResult::Challenge(AlpnPending {
-                key_authorization,
-                challenge_url,
-                order,
-                tx,
-            }));
+            // Leader: drive the LE order. On failure, remove the in_flight
+            // entry and drop the senders so any concurrent followers wake up
+            // with `Err` and can retry from scratch.
+            info!("ACME: provisioning cert for {}", domain);
+            let setup = async {
+                let mut order = self
+                    .account
+                    .new_order(&NewOrder::new(&[Identifier::Dns(domain.to_string())]))
+                    .await?;
+
+                let mut challenge_url = String::new();
+                let mut key_authorization = String::new();
+                let mut authorizations = order.authorizations();
+                while let Some(result) = authorizations.next().await {
+                    let mut authz = result?;
+                    if authz.status == AuthorizationStatus::Valid {
+                        continue;
+                    }
+                    let challenge = authz.challenge(ChallengeType::TlsAlpn01).ok_or_else(
+                        || anyhow::anyhow!("no TLS-ALPN-01 challenge for {}", domain),
+                    )?;
+                    key_authorization = challenge.key_authorization().as_str().to_string();
+                    challenge_url = challenge.url.clone();
+                }
+                Ok::<_, anyhow::Error>((order, key_authorization, challenge_url))
+            };
+
+            match setup.await {
+                Ok((order, key_authorization, challenge_url)) => {
+                    // Publish key_auth to any followers blocked on `changed()`.
+                    let _ = key_auth_tx.send(Some(key_authorization.clone()));
+                    return Ok(PrepareResult::LeaderChallenge(AlpnPending {
+                        key_authorization,
+                        challenge_url,
+                        order,
+                        tx: cert_tx,
+                    }));
+                }
+                Err(e) => {
+                    self.in_flight.lock().await.remove(domain);
+                    drop(key_auth_tx);
+                    drop(cert_tx);
+                    return Err(e);
+                }
+            }
         } // end loop
     }
 
@@ -253,16 +322,10 @@ async fn load_or_create_account(email: Option<&str>, staging: bool, path: &str) 
     Ok(account)
 }
 
-/// Builds an HTTP client for the ACME flow that uses the Mozilla CA bundle
-/// (`webpki-roots`) and does NOT perform OS-level revocation checking.
-///
-/// `rustls-platform-verifier` (the default trust path in `hyper-rustls`) on
-/// Android maps LE's CRL-only revocation cert profile to `Revoked` because the
-/// Kotlin sidecar's PKIX configuration doesn't fall back to CRL when an OCSP
-/// responder URL is missing. Trading revocation enforcement for connectivity
-/// here is acceptable: LE end-entity certs are short-lived, the relay TLS path
-/// is independently validated against the OS native trust store, and the ACME
-/// HTTPS surface is narrow (one host, one CA chain).
+/// Builds an HTTP client for the ACME flow backed by the Mozilla CA bundle
+/// (`webpki-roots`). No OS-level trust store or revocation checking — the
+/// ACME surface is narrow (one host, one CA chain) and LE end-entity certs
+/// are short-lived enough that pinned roots are an acceptable trade-off.
 fn make_acme_http_client() -> Box<dyn instant_acme::HttpClient> {
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
