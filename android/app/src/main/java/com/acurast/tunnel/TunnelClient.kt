@@ -1,6 +1,5 @@
 package com.acurast.tunnel
 
-import android.content.Context
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -74,14 +73,20 @@ public class TunnelClient internal constructor(
         }
 
         /**
-         * Initializes `rustls-platform-verifier` with the host app's [Context].
-         * Must be called once before constructing any [TunnelClient]. Both the
-         * Let's Encrypt HTTPS client and the QUIC relay TLS layer drive
-         * certificate verification through Android's platform store, which
-         * requires the JVM context.
+         * Wires the Rust-side `android_logger` so transitive logs from
+         * `hyper`, `quinn`, `instant-acme`, `rustls`, and `tunnel_client`
+         * reach logcat. Must be called once before constructing any
+         * [TunnelClient].
+         *
+         * [filterSpec] is an env_logger-style filter string. Typical values:
+         *   - `"debug"` (verbose: matches a debug build)
+         *   - `"info"` (production default)
+         *   - `"tunnel_client=trace,hyper=info"` (per-module overrides)
+         *
+         * Invalid strings fall back to `"info"` on the Rust side.
          */
         @JvmStatic
-        public external fun initAndroid(context: Context)
+        public external fun initAndroid(filterSpec: String)
     }
 }
 
