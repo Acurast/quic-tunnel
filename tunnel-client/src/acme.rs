@@ -122,6 +122,14 @@ impl CertProvisioner {
                 cert_rx,
             }) = existing
             {
+                // If the leader's `cert_tx` is already gone (finalize errored
+                // or panicked), the entry is stale. Drop it and retry the loop
+                // so this caller can claim leader instead of becoming a
+                // follower of a dead sender.
+                if cert_rx.has_changed().is_err() {
+                    self.in_flight.lock().await.remove(domain);
+                    continue;
+                }
                 // Fast path: leader has already published key_auth.
                 let cached = key_auth_rx.borrow().clone();
                 if let Some(key_authorization) = cached {
@@ -227,64 +235,78 @@ impl CertProvisioner {
 
     /// Phase 2: signal challenge ready, poll until validated, finalize, cache.
     /// Call only after ALPN challenge streams are being served.
+    ///
+    /// The `in_flight` HashMap entry for `domain` is removed on every exit
+    /// path (success or error). This is critical: without it, a failed
+    /// finalize would leave a stale entry whose `key_auth_rx` still reports
+    /// `Some(key_authorization)`, causing subsequent `prepare()` calls to
+    /// take the follower fast path and immediately fail on the
+    /// already-dropped `cert_tx`.
     pub async fn finalize(
         &self,
         domain: &str,
         mut pending: AlpnPending,
         csr_der: &[u8],
     ) -> Result<String> {
-        if !pending.challenge_url.is_empty() {
-            let mut authorizations = pending.order.authorizations();
-            while let Some(result) = authorizations.next().await {
-                let mut authz = result?;
-                if authz.status == AuthorizationStatus::Valid {
-                    continue;
+        let result: Result<String> = async {
+            if !pending.challenge_url.is_empty() {
+                let mut authorizations = pending.order.authorizations();
+                while let Some(result) = authorizations.next().await {
+                    let mut authz = result?;
+                    if authz.status == AuthorizationStatus::Valid {
+                        continue;
+                    }
+                    if let Some(mut challenge) = authz.challenge(ChallengeType::TlsAlpn01) {
+                        challenge.set_ready().await?;
+                        break;
+                    }
                 }
-                if let Some(mut challenge) = authz.challenge(ChallengeType::TlsAlpn01) {
-                    challenge.set_ready().await?;
-                    break;
+            }
+
+            let mut delay = Duration::from_secs(2);
+            for _ in 0..12 {
+                tokio::time::sleep(delay).await;
+                let state = pending.order.refresh().await?;
+                match state.status {
+                    OrderStatus::Ready | OrderStatus::Valid => break,
+                    OrderStatus::Invalid => bail!("ACME order invalid for {}", domain),
+                    _ => {}
                 }
+                delay = (delay * 2).min(Duration::from_secs(15));
             }
-        }
 
-        let mut delay = Duration::from_secs(2);
-        for _ in 0..12 {
-            tokio::time::sleep(delay).await;
-            let state = pending.order.refresh().await?;
-            match state.status {
-                OrderStatus::Ready | OrderStatus::Valid => break,
-                OrderStatus::Invalid => bail!("ACME order invalid for {}", domain),
-                _ => {}
+            pending.order.finalize_csr(csr_der).await?;
+
+            let cert_pem = loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if let Some(cert) = pending.order.certificate().await? {
+                    break cert;
+                }
+            };
+
+            info!("ACME: cert issued for {}", domain);
+            if let Some(cb) = &self.on_cert_issued {
+                cb(cert_pem.clone());
             }
-            delay = (delay * 2).min(Duration::from_secs(15));
+            self.cache.lock().await.insert(
+                domain.to_string(),
+                CacheEntry {
+                    cert_pem: cert_pem.clone(),
+                    issued_at: Instant::now(),
+                },
+            );
+
+            // Notify waiting concurrent callers. The in_flight cleanup runs
+            // unconditionally after this async block, regardless of outcome.
+            let _ = pending.tx.send(Some(cert_pem.clone()));
+
+            Ok(cert_pem)
         }
+        .await;
 
-        pending.order.finalize_csr(csr_der).await?;
-
-        let cert_pem = loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            if let Some(cert) = pending.order.certificate().await? {
-                break cert;
-            }
-        };
-
-        info!("ACME: cert issued for {}", domain);
-        if let Some(cb) = &self.on_cert_issued {
-            cb(cert_pem.clone());
-        }
-        self.cache.lock().await.insert(
-            domain.to_string(),
-            CacheEntry {
-                cert_pem: cert_pem.clone(),
-                issued_at: Instant::now(),
-            },
-        );
-
-        // Notify waiting concurrent callers and clean up in_flight entry
-        let _ = pending.tx.send(Some(cert_pem.clone()));
         self.in_flight.lock().await.remove(domain);
 
-        Ok(cert_pem)
+        result
     }
 }
 
