@@ -105,3 +105,7 @@ tasks.configureEach {
         dependsOn("ffiBuild")
     }
 }
+
+tasks.matching { it.name.startsWith("compile") && it.name.endsWith("Kotlin") }.configureEach {
+    dependsOn("ffiBuild")
+}

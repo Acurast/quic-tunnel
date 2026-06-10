@@ -1,22 +1,22 @@
 use crate::acme::{CertProvisioner, PrepareResult};
 use crate::key::{KeyAlgorithm, RcgenRemoteKey, RustlsRemoteKey, TunnelKey};
-use p256::elliptic_curve::sec1::ToEncodedPoint;
 use anyhow::Result;
 use log::{debug, error, info, warn};
+use p256::elliptic_curve::sec1::ToEncodedPoint;
 use rustls::pki_types::CertificateDer;
 use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use sha2::{Digest, Sha256};
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use tokio::{net::TcpStream, sync::Notify};
 use tunnel_common::{
-    build_alpn_acceptor, ctrl_read, ctrl_write, H2Recv, H2Send, NoVerify, CUSTOM_DATA_EXT_OID, IO,
+    CUSTOM_DATA_EXT_OID, H2Recv, H2Send, IO, NoVerify, build_alpn_acceptor, ctrl_read, ctrl_write,
 };
 
 /// Maximum number of consecutive failed reconnect attempts before the
@@ -44,6 +44,9 @@ pub struct TunnelIdentityConfig {
 pub struct TunnelConfig {
     pub server_addrs: Vec<String>,
     pub local_addr: String,
+    /// Local address the secondary (self-signed) connection forwards to.
+    /// `None` → falls back to `local_addr` (same target as primary).
+    pub secondary_local_addr: Option<String>,
     pub domain_suffix: String,
     pub force_h2: bool,
     pub pool_size: usize,
@@ -187,23 +190,37 @@ impl TunnelClient {
 
         let mut handles = Vec::new();
         for server_addr in &self.config.server_addrs {
-            // Primary connection (ACME-backed tunnel cert).
+            // Primary connection (ACME-backed tunnel cert). Forwards to local_addr.
             {
                 let server_addr = server_addr.clone();
                 let provisioner = provisioner.clone();
                 let this = Arc::clone(&self);
                 handles.push(tokio::spawn(async move {
-                    this.connection_run(&this.primary, &server_addr, Some(provisioner), "PRI")
-                        .await
+                    let target = &this.config.local_addr;
+                    this.connection_run(
+                        &this.primary,
+                        &server_addr,
+                        Some(provisioner),
+                        "PRI",
+                        target,
+                    )
+                    .await
                 }));
             }
-            // Secondary connection (self-signed tunnel cert, no ACME).
+            // Secondary connection (self-signed tunnel cert, no ACME). Forwards to
+            // secondary_local_addr when set, else falls back to local_addr.
             if self.secondary.is_some() {
                 let server_addr = server_addr.clone();
                 let this = Arc::clone(&self);
                 handles.push(tokio::spawn(async move {
                     let sec = this.secondary.as_ref().expect("secondary present");
-                    this.connection_run(sec, &server_addr, None, "SEC").await
+                    let target = this
+                        .config
+                        .secondary_local_addr
+                        .as_deref()
+                        .unwrap_or(&this.config.local_addr);
+                    this.connection_run(sec, &server_addr, None, "SEC", target)
+                        .await
                 }));
             }
         }
@@ -224,15 +241,18 @@ impl TunnelClient {
         server_addr: &str,
         provisioner: Option<Arc<CertProvisioner>>,
         tag: &str,
+        target_addr: &str,
     ) -> Result<()> {
         if !self.config.force_h2 {
-            self.quic_run(conn_m, server_addr, provisioner, tag).await
+            self.quic_run(conn_m, server_addr, provisioner, tag, target_addr)
+                .await
         } else {
             info!(
                 "H2[{}/{}]: FORCE_HTTP2 set, skipping QUIC",
                 tag, server_addr
             );
-            self.h2_pool(conn_m, server_addr, provisioner, tag).await
+            self.h2_pool(conn_m, server_addr, provisioner, tag, target_addr)
+                .await
         }
     }
 
@@ -242,6 +262,7 @@ impl TunnelClient {
         server_addr: &str,
         provisioner: Option<Arc<CertProvisioner>>,
         tag: &str,
+        target_addr: &str,
     ) -> Result<()> {
         let mut attempts: u32 = 0;
         let mut backoff = RECONNECT_BASE_BACKOFF;
@@ -259,7 +280,9 @@ impl TunnelClient {
                         "QUIC[{}/{}]: connection failed ({}), falling back to H2",
                         tag, server_addr, e
                     );
-                    return self.h2_pool(conn_m, server_addr, provisioner, tag).await;
+                    return self
+                        .h2_pool(conn_m, server_addr, provisioner, tag, target_addr)
+                        .await;
                 }
                 Ok(conn) => {
                     info!("QUIC[{}/{}]: connected", tag, server_addr);
@@ -271,6 +294,7 @@ impl TunnelClient {
                             server_addr,
                             provisioner.clone(),
                             tag,
+                            target_addr,
                             Arc::clone(&ctrl_completed),
                         )
                         .await
@@ -313,6 +337,7 @@ impl TunnelClient {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn quic_loop(
         &self,
         conn_m: &Connection,
@@ -320,6 +345,7 @@ impl TunnelClient {
         server_addr: &str,
         provisioner: Option<Arc<CertProvisioner>>,
         tag: &str,
+        target_addr: &str,
         ctrl_completed: Arc<AtomicBool>,
     ) -> Result<()> {
         let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?;
@@ -351,7 +377,10 @@ impl TunnelClient {
                     }
                     PrepareResult::LeaderChallenge(alpn_pending) => {
                         let ka = alpn_pending.key_authorization.clone();
-                        debug!("QUIC[{}]: leader, building ALPN acceptor for challenge", tag);
+                        debug!(
+                            "QUIC[{}]: leader, building ALPN acceptor for challenge",
+                            tag
+                        );
                         let alpn_acceptor = build_alpn_acceptor(&conn_m.domain, &ka)?;
 
                         // Send key_auth, wait for server ACK (server registers pending_alpn)
@@ -462,7 +491,7 @@ impl TunnelClient {
             Arc::clone(&conn_m.agent_keypair)
         };
         let acceptor = build_tls_acceptor(user_tls_keypair, tunnel_certs)?;
-        let local_addr = self.config.local_addr.clone();
+        let local_addr = target_addr.to_string();
 
         loop {
             tokio::select! {
@@ -487,6 +516,7 @@ impl TunnelClient {
         server_addr: &str,
         provisioner: Option<Arc<CertProvisioner>>,
         tag: &str,
+        target_addr: &str,
     ) -> Result<()> {
         info!(
             "H2[{}/{}]: starting pool of {} connections",
@@ -495,7 +525,7 @@ impl TunnelClient {
         let handles: Vec<_> = (0..self.config.pool_size)
             .map(|i| {
                 let server_addr = server_addr.to_string();
-                let local_addr = self.config.local_addr.clone();
+                let local_addr = target_addr.to_string();
                 let agent_cert_der = conn_m.agent_cert_der.clone();
                 let agent_keypair = Arc::clone(&conn_m.agent_keypair);
                 let identity_keypair = Arc::clone(&conn_m.identity_keypair);

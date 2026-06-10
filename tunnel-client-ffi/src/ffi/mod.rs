@@ -66,6 +66,7 @@ pub struct PrimaryConnection {
 #[derive(uniffi::Record, Clone, Debug, Default)]
 pub struct SecondaryConnection {
     pub cert_extension: Option<Vec<u8>>,
+    pub local_addr: Option<String>,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
@@ -174,6 +175,7 @@ impl TunnelClient {
         let inner_cfg = tc::TunnelConfig {
             server_addrs: config.server_addrs,
             local_addr: config.local_addr,
+            secondary_local_addr: config.secondary.as_ref().and_then(|s| s.local_addr.clone()),
             domain_suffix: config.domain_suffix,
             force_h2: config.force_h2,
             pool_size: config.pool_size as usize,
