@@ -15,6 +15,11 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:3000")]
     local: String,
 
+    /// Local service address the secondary (self-signed) connection forwards to.
+    /// When unset, the secondary reuses `--local`. Only relevant with `--secondary-key`.
+    #[arg(long)]
+    secondary_local: Option<String>,
+
     /// Domain suffix for the tunnel URL (e.g. "yourserver.com")
     #[arg(long, default_value = "localhost")]
     domain_suffix: String,
@@ -133,6 +138,9 @@ async fn main() -> Result<()> {
             "--secondary-cert-extension-hex ignored because --secondary-key was not provided"
         );
     }
+    if self_signed_identity.is_none() && args.secondary_local.is_some() {
+        log::warn!("--secondary-local ignored because --secondary-key was not provided");
+    }
 
     let self_signed_identity_config = self_signed_identity.map(|keypair| TunnelIdentityConfig {
         keypair,
@@ -142,6 +150,7 @@ async fn main() -> Result<()> {
     let config = TunnelConfig {
         server_addrs: args.server,
         local_addr: args.local,
+        secondary_local_addr: args.secondary_local,
         domain_suffix: args.domain_suffix,
         force_h2: args.force_h2,
         pool_size: args.pool_size,

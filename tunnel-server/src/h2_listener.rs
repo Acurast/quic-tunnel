@@ -106,7 +106,16 @@ async fn handle_h2_connection(
         }
     };
 
-    let id = h2_ctrl_exchange(
+    // `SendRequest` only queues frames; the `Connection` future performs the actual
+    // socket I/O and must be polled for the control exchange below to make progress
+    // (and for the ACME `/_ctrl/alpn` proxying that reuses the sender via `pending`).
+    // Drive it for the connection's whole lifetime starting now — spawning it only
+    // after the exchange deadlocks step 1.
+    let conn_task = tokio::spawn(async move {
+        let _ = h2_conn.await;
+    });
+
+    let id = match h2_ctrl_exchange(
         &mut h2_sender,
         remote,
         &pending,
@@ -114,10 +123,19 @@ async fn handle_h2_connection(
         auth_token,
         &resolver,
     )
-    .await?;
+    .await
+    {
+        Some(id) => id,
+        None => {
+            conn_task.abort();
+            return None;
+        }
+    };
 
+    // register() spawns a task that awaits `done` then unregisters the agent;
+    // awaiting the driver handle preserves that "remove on disconnect" contract.
     register(&agents, id, Agent::H2(h2_sender), async move {
-        let _ = h2_conn.await;
+        let _ = conn_task.await;
     })
     .await;
     Some(())

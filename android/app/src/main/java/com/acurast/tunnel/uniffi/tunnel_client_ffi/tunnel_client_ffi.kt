@@ -2500,7 +2500,12 @@ public object FfiConverterTypePrimaryKey: FfiConverterRustBuffer<PrimaryKey> {
 
 
 data class SecondaryConnection (
-    var `certExtension`: kotlin.ByteArray?
+    var `certExtension`: kotlin.ByteArray?, 
+    /**
+     * Local address the secondary connection forwards to. `None` → reuses the
+     * primary's `TunnelConfig.local_addr`.
+     */
+    var `localAddr`: kotlin.String?
 ) {
     
     companion object
@@ -2513,15 +2518,18 @@ public object FfiConverterTypeSecondaryConnection: FfiConverterRustBuffer<Second
     override fun read(buf: ByteBuffer): SecondaryConnection {
         return SecondaryConnection(
             FfiConverterOptionalByteArray.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
     override fun allocationSize(value: SecondaryConnection) = (
-            FfiConverterOptionalByteArray.allocationSize(value.`certExtension`)
+            FfiConverterOptionalByteArray.allocationSize(value.`certExtension`) +
+            FfiConverterOptionalString.allocationSize(value.`localAddr`)
     )
 
     override fun write(value: SecondaryConnection, buf: ByteBuffer) {
             FfiConverterOptionalByteArray.write(value.`certExtension`, buf)
+            FfiConverterOptionalString.write(value.`localAddr`, buf)
     }
 }
 
