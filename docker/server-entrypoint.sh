@@ -15,7 +15,6 @@ exec server \
     ${BIND_ADDR:+--bind-addr "$BIND_ADDR"} \
     ${API_PORT:+--api-port "$API_PORT"} \
     ${PUB_PORT:+--pub-port "$PUB_PORT"} \
-    ${ALPN_PORT:+--alpn-port "$ALPN_PORT"} \
     ${TLS_CERT_PATH:+--tls-cert "$TLS_CERT_PATH"} \
     ${TLS_KEY_PATH:+--tls-key "$TLS_KEY_PATH"} \
     ${ACME_DOMAIN:+--acme-domain "$ACME_DOMAIN"} \

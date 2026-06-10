@@ -12,13 +12,10 @@ struct Args {
     #[arg(long, default_value_t = 4433)]
     api_port: u16,
 
-    /// Public port for user connections
-    #[arg(long, default_value_t = 8443)]
-    pub_port: u16,
-
-    /// TLS-ALPN-01 challenge port (must be reachable as port 443)
+    /// Public port for user connections. Must be reachable as port 443 so
+    /// Let's Encrypt can complete TLS-ALPN-01 challenges on the same listener.
     #[arg(long, default_value_t = 443)]
-    alpn_port: u16,
+    pub_port: u16,
 
     /// Allowed domain suffixes; clients with other suffixes are rejected.
     /// Repeat the flag for multiple suffixes: --domain-suffix a.com --domain-suffix b.com.
@@ -68,7 +65,6 @@ async fn main() -> Result<()> {
         bind_addr: args.bind_addr,
         api_port: args.api_port,
         pub_port: args.pub_port,
-        alpn_port: args.alpn_port,
         domain_suffixes: args.domain_suffix,
         cert_path: args.tls_cert,
         key_path: args.tls_key,
