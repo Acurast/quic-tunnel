@@ -43,16 +43,14 @@ A fast, modern reverse tunnel that exposes your local services to the internet. 
 │  ┌────────────────┐    ┌────────────────┐    ┌────────────────────────────┐ │
 │  │   API Port     │    │   Public Port  │    │      Agent Registry        │ │
 │  │  (QUIC + TCP)  │    │   (TCP/TLS)    │    │  client_id → [connections] │ │
-│  │    :4433       │    │     :8443      │    └────────────────────────────┘ │
+│  │    :4433       │    │     :443       │    └────────────────────────────┘ │
 │  └───────┬────────┘    └───────┬────────┘                                   │
-│          │                     │      ┌────────────────────────────┐        │
-│          │                     │      │     ALPN Port (TLS-ALPN-01)│        │
-│          │                     │      │            :443            │        │
-│          │                     │      │  Server's own LE cert      │        │
-│          │                     │      │  (auto-renewed)            │        │
-│          │                     │      └────────────────────────────┘        │
+│          │                     │   Dispatches by ALPN:                      │
+│          │                     │   • acme-tls/1 → TLS-ALPN-01 (LE certs,    │
+│          │                     │     server's own + per-client, proxied)    │
+│          │                     │   • otherwise  → public user traffic       │
 │          │  Agents connect     │  Users connect via                         │
-│          │  and register       │  {client_id}.<suffix>:8443                 │
+│          │  and register       │  {client_id}.<suffix>  (port 443)          │
 └──────────┼─────────────────────┼────────────────────────────────────────────┘
            │                     │
      QUIC streams          SNI routing
@@ -115,7 +113,7 @@ Two independent ACME flows, used at three different listeners:
 - **Server cert** — presented to **agents** on the API port (`:4433`, QUIC + H2). Also briefly presented on `:443` during the server's own TLS-ALPN-01 challenge while it provisions/renews its cert. Provisioned via TLS-ALPN-01 when `--acme-domain` is set (`:443` must be reachable from the public internet); otherwise loaded from a `--tls-cert` PEM, or self-signed if neither is provided.
 - **Per-client cert** — each tunnel client provisions its own publicly trusted LE cert for `{client_id}.<domain-suffix>` via TLS-ALPN-01 with the challenge proxied through the relay's `:443` listener. The client terminates user TLS itself using this cert.
 
-The **public port (`:8443`)** does not terminate TLS at the relay — it peeks the ClientHello, routes by SNI, and forwards raw TCP bytes through the tunnel; TLS is terminated at the client.
+The **public port (`:443`)** does not terminate TLS at the relay — it peeks the ClientHello, routes by SNI, and forwards raw TCP bytes through the tunnel; TLS is terminated at the client. The same listener also serves TLS-ALPN-01 challenges (ClientHellos advertising the `acme-tls/1` ALPN protocol), so Let's Encrypt validation and public traffic share port 443.
 
 Optional **secondary endpoint** per client (`--secondary-key`) opens a second connection that terminates user TLS with a self-signed cert (no ACME).
 
@@ -255,8 +253,7 @@ Server CLI flags (`./target/release/server --help`):
 |------|---------|---------|
 | `--bind-addr` | `0.0.0.0` | Bind address for all listeners |
 | `--api-port` | `4433` | QUIC + H2 agent port |
-| `--pub-port` | `8443` | Public user-facing TLS port |
-| `--alpn-port` | `443` | TLS-ALPN-01 challenge port (must be reachable as 443) |
+| `--pub-port` | `443` | Public user-facing TLS port; also serves TLS-ALPN-01 challenges (must be reachable as 443) |
 | `--domain-suffix` | _(any)_ | Allowlisted client suffix; repeatable |
 | `--tls-cert`, `--tls-key` | _(none)_ | PEM cert + key paths |
 | `--acme-domain` | _(none)_ | Enables server ACME provisioning |
@@ -286,7 +283,7 @@ The client logs:
 
 ```
 ID: a1b2c3d4...
-URL: https://a1b2c3d4....yourserver.com:8443
+URL: https://a1b2c3d4....yourserver.com
 ```
 
 Client CLI flags (`./target/release/client --help`):
@@ -318,8 +315,8 @@ Client CLI flags (`./target/release/client --help`):
 
 Exposes two endpoints for the same local service:
 
-- `https://{primary_id}.yourserver.com:8443` — publicly trusted (Let's Encrypt)
-- `https://{secondary_id}.yourserver.com:8443` — self-signed (use `curl -k` or pin the cert)
+- `https://{primary_id}.yourserver.com` — publicly trusted (Let's Encrypt)
+- `https://{secondary_id}.yourserver.com` — self-signed (use `curl -k` or pin the cert)
 
 ### Docker Compose
 

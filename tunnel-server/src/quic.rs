@@ -4,8 +4,8 @@ use std::sync::Arc;
 use tunnel_common::{ctrl_read, ctrl_write};
 
 use crate::util::{
-    allowed_suffix, compute_txt_expected, custom_data_from_cert, pubkey_from_cert,
-    recover_identity_pubkey, register,
+    allowed_suffix, custom_data_from_cert, pubkey_from_cert, recover_identity_pubkey, register,
+    txt_authorizes,
 };
 use crate::{Agent, AgentMap, AuthHandler, PendingAlpnConn, PendingAlpnMap};
 
@@ -174,15 +174,13 @@ async fn quic_ctrl_exchange(
     if let Some(ref deployment_source) = auth_token {
         let host = domain.split_once('.').map(|x| x.1).unwrap_or("");
         let txt_name = format!("_acu.{}.", host);
-        let expected = compute_txt_expected(deployment_source, host);
         match resolver.txt_lookup(&txt_name).await {
             Ok(lookup) => {
-                let matched = lookup.iter().any(|r| {
-                    r.txt_data()
-                        .iter()
-                        .any(|d| d.as_ref() == expected.as_bytes())
-                });
-                if !matched {
+                let values: Vec<&[u8]> = lookup
+                    .iter()
+                    .flat_map(|r| r.txt_data().iter().map(|d| d.as_ref()))
+                    .collect();
+                if !txt_authorizes(&values, deployment_source, host) {
                     warn!(
                         "QUIC: TXT record mismatch for {} (client_id={})",
                         txt_name, id
@@ -207,7 +205,7 @@ async fn quic_ctrl_exchange(
     };
 
     if !key_auth.is_empty() {
-        // Register this connection so run_alpn_listener can proxy LE's port-443 connections
+        // Register this connection so handle_acme can proxy LE's port-443 connections
         pending.insert(id.clone(), PendingAlpnConn::Quic(conn.clone()));
         // ACK so client knows it can start handling ALPN challenge streams
         if let Err(e) = ctrl_write(ctrl_send, b"ack").await {

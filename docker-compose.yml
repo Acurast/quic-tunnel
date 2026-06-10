@@ -22,10 +22,9 @@ services:
       # ACME_RENEW_DAYS: "30"
       # 3. Neither set → in-memory self-signed (dev only)
     ports:
-      - "443:443/tcp" # TLS-ALPN-01 challenge port (Let's Encrypt validation)
+      - "443:443/tcp" # Public port (user connections) + TLS-ALPN-01 challenges
       - "4433:4433/udp" # QUIC (agent connections)
       - "4433:4433/tcp" # HTTP/2 (agent connections)
-      - "8443:8443/tcp" # Public port (user connections)
     volumes:
       - server-data:/data
     restart: unless-stopped

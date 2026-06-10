@@ -5,8 +5,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tunnel_common::collect_h2_body;
 
 use crate::util::{
-    allowed_suffix, compute_txt_expected, custom_data_from_cert, pubkey_from_cert,
-    recover_identity_pubkey, register,
+    allowed_suffix, custom_data_from_cert, pubkey_from_cert, recover_identity_pubkey, register,
+    txt_authorizes,
 };
 use crate::{Agent, AgentMap, AuthHandler, PendingAlpnConn, PendingAlpnMap};
 
@@ -106,7 +106,16 @@ async fn handle_h2_connection(
         }
     };
 
-    let id = h2_ctrl_exchange(
+    // `SendRequest` only queues frames; the `Connection` future performs the actual
+    // socket I/O and must be polled for the control exchange below to make progress
+    // (and for the ACME `/_ctrl/alpn` proxying that reuses the sender via `pending`).
+    // Drive it for the connection's whole lifetime starting now — spawning it only
+    // after the exchange deadlocks step 1.
+    let conn_task = tokio::spawn(async move {
+        let _ = h2_conn.await;
+    });
+
+    let id = match h2_ctrl_exchange(
         &mut h2_sender,
         remote,
         &pending,
@@ -114,10 +123,19 @@ async fn handle_h2_connection(
         auth_token,
         &resolver,
     )
-    .await?;
+    .await
+    {
+        Some(id) => id,
+        None => {
+            conn_task.abort();
+            return None;
+        }
+    };
 
+    // register() spawns a task that awaits `done` then unregisters the agent;
+    // awaiting the driver handle preserves that "remove on disconnect" contract.
     register(&agents, id, Agent::H2(h2_sender), async move {
-        let _ = h2_conn.await;
+        let _ = conn_task.await;
     })
     .await;
     Some(())
@@ -214,15 +232,13 @@ async fn h2_ctrl_exchange(
     if let Some(ref deployment_source) = auth_token {
         let host = domain.split_once('.').map(|x| x.1).unwrap_or("");
         let txt_name = format!("_acu.{}.", host);
-        let expected = compute_txt_expected(deployment_source, host);
         match resolver.txt_lookup(&txt_name).await {
             Ok(lookup) => {
-                let matched = lookup.iter().any(|r| {
-                    r.txt_data()
-                        .iter()
-                        .any(|d| d.as_ref() == expected.as_bytes())
-                });
-                if !matched {
+                let values: Vec<&[u8]> = lookup
+                    .iter()
+                    .flat_map(|r| r.txt_data().iter().map(|d| d.as_ref()))
+                    .collect();
+                if !txt_authorizes(&values, deployment_source, host) {
                     warn!(
                         "H2: TXT record mismatch for {} (client_id={})",
                         txt_name, id
@@ -262,10 +278,10 @@ async fn h2_ctrl_exchange(
     };
 
     if !key_auth.is_empty() {
-        // Register so run_alpn_listener can proxy LE's port-443 connections to this client
+        // Register so handle_acme can proxy LE's port-443 connections to this client
         pending.insert(id.clone(), PendingAlpnConn::H2(sender.clone()));
         // Long-poll GET /_ctrl/done — client holds the response until ACME finalize completes,
-        // while concurrently handling /_ctrl/alpn challenge streams from run_alpn_listener.
+        // while concurrently handling /_ctrl/alpn challenge streams from handle_acme.
         let req = http::Request::builder()
             .method("GET")
             .uri("/_ctrl/done")
