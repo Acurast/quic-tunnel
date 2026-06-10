@@ -43,11 +43,10 @@ RUN chmod +x /entrypoint.sh
 VOLUME /data
 WORKDIR /data
 
-# 443/tcp  — TLS-ALPN-01 challenge port (Let's Encrypt validation)
+# 443/tcp  — public port (user connections) + TLS-ALPN-01 challenges
 # 4433/udp — QUIC (agent connections)
 # 4433/tcp — HTTP/2 (agent connections)
-# 8443/tcp — public port (user connections)
-EXPOSE 443/tcp 4433/udp 4433/tcp 8443/tcp
+EXPOSE 443/tcp 4433/udp 4433/tcp
 
 ENTRYPOINT ["/entrypoint.sh"]
 

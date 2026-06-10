@@ -280,10 +280,10 @@ async fn h2_ctrl_exchange(
     };
 
     if !key_auth.is_empty() {
-        // Register so run_alpn_listener can proxy LE's port-443 connections to this client
+        // Register so handle_acme can proxy LE's port-443 connections to this client
         pending.insert(id.clone(), PendingAlpnConn::H2(sender.clone()));
         // Long-poll GET /_ctrl/done — client holds the response until ACME finalize completes,
-        // while concurrently handling /_ctrl/alpn challenge streams from run_alpn_listener.
+        // while concurrently handling /_ctrl/alpn challenge streams from handle_acme.
         let req = http::Request::builder()
             .method("GET")
             .uri("/_ctrl/done")

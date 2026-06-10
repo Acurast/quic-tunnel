@@ -90,19 +90,35 @@ pub(crate) fn compute_txt_expected(deployment_source: &[u8], host: &str) -> Stri
     general_purpose::STANDARD.encode(digest)
 }
 
-pub(crate) fn extract_sni(data: &[u8]) -> Option<&str> {
+/// ACME TLS-ALPN-01 challenge clients advertise this ALPN protocol id (RFC 8737).
+const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
+
+/// Parse a ClientHello and return its SNI together with whether the connection
+/// is an ACME TLS-ALPN-01 challenge (ALPN list contains `acme-tls/1`). Returns
+/// `None` when there is no SNI.
+pub(crate) fn extract_sni_alpn(data: &[u8]) -> Option<(&str, bool)> {
     let (_, plaintext) = parse_tls_plaintext(data).ok()?;
     let hello = match plaintext.msg.first()? {
         TlsMessage::Handshake(TlsMessageHandshake::ClientHello(h)) => h,
         _ => return None,
     };
     let (_, extensions) = parse_tls_extensions(hello.ext?).ok()?;
-    extensions.iter().find_map(|ext| match ext {
-        TlsExtension::SNI(names) => names
-            .first()
-            .and_then(|(_, name)| std::str::from_utf8(name).ok()),
-        _ => None,
-    })
+    let mut sni = None;
+    let mut is_acme = false;
+    for ext in &extensions {
+        match ext {
+            TlsExtension::SNI(names) => {
+                sni = names
+                    .first()
+                    .and_then(|(_, name)| std::str::from_utf8(name).ok());
+            }
+            TlsExtension::ALPN(protos) => {
+                is_acme = protos.iter().any(|p| *p == ACME_TLS_ALPN);
+            }
+            _ => {}
+        }
+    }
+    sni.map(|s| (s, is_acme))
 }
 
 #[cfg(test)]

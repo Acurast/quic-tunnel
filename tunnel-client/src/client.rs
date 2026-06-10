@@ -737,7 +737,7 @@ fn build_connection(
     };
     let client_id = hex::encode(&Sha256::digest(&id_bytes)[0..8]);
     let domain = format!("{}.{}", client_id, domain_suffix);
-    let url = format!("https://{}:8443", domain);
+    let url = format!("https://{}", domain);
 
     let agent_rcgen_key = RcgenRemoteKey::new(Arc::clone(&agent_keypair));
 

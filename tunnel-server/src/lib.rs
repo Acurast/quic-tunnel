@@ -85,8 +85,10 @@ enum PendingAlpnConn {
 pub struct ServerConfig {
     pub bind_addr: String,
     pub api_port: u16,
+    /// Public traffic port. Must be reachable as port 443 so Let's Encrypt can
+    /// complete TLS-ALPN-01 challenges; the same listener serves public user
+    /// traffic and ACME challenges, dispatched by ALPN.
     pub pub_port: u16,
-    pub alpn_port: u16,
     /// Allowed domain suffixes (e.g. `["yourserver.com"]`). Clients whose domain
     /// does not end with one of these suffixes are rejected. If empty, the
     /// allowlist is disabled and all client domains are accepted.
@@ -124,11 +126,7 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let api_addr = format!("{}:{}", config.bind_addr, config.api_port);
     let pub_addr = format!("{}:{}", config.bind_addr, config.pub_port);
-    let alpn_addr = format!("{}:{}", config.bind_addr, config.alpn_port);
-    info!(
-        "ROUTER: API {} | PUB {} | ALPN {}",
-        api_addr, pub_addr, alpn_addr
-    );
+    info!("ROUTER: API {} | PUB {}", api_addr, pub_addr);
     if config.domain_suffixes.is_empty() {
         info!("ROUTER: domain suffix allowlist disabled (accepting all domains)");
     } else {
@@ -143,14 +141,10 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     let agents: AgentMap = Arc::new(DashMap::new());
     let server_challenge: ServerChallenge = Arc::new(tokio::sync::Mutex::new(None));
 
-    // Bind and start ALPN listener before cert selection: the server's own ACME
-    // TLS-ALPN-01 challenge must be handled here while provision_acme_cert() runs.
-    let alpn_listener = TcpListener::bind(&alpn_addr).await?;
-    tokio::spawn(alpn::run_alpn_listener(
-        alpn_listener,
-        pending_alpn.clone(),
-        server_challenge.clone(),
-    ));
+    // Bind the public listener before cert selection: the server's own ACME
+    // TLS-ALPN-01 challenge must be serviceable here while provision_acme_cert()
+    // runs. The public branch is a no-op until clients register (agents empty).
+    let pub_listener = TcpListener::bind(&pub_addr).await?;
 
     let cert_paths = cert::determine_cert(&config, &server_challenge).await?;
     let server_tls = cert::build_server_tls_config(&config, &cert_paths, &server_challenge)?;
@@ -163,7 +157,6 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     )?;
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls));
     let tcp_listener = TcpListener::bind(&api_addr).await?;
-    let pub_listener = TcpListener::bind(&pub_addr).await?;
 
     let resolver = Arc::new(hickory_resolver::TokioAsyncResolver::tokio(
         hickory_resolver::config::ResolverConfig::default(),
@@ -182,11 +175,11 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         tcp_listener,
         tls_acceptor,
         agents.clone(),
-        pending_alpn,
+        pending_alpn.clone(),
         domain_suffixes,
         auth_handler,
         resolver,
     ));
 
-    public::run_public_listener(pub_listener, agents).await
+    public::run_public_listener(pub_listener, agents, pending_alpn, server_challenge).await
 }
