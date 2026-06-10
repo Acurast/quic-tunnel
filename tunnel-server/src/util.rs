@@ -90,6 +90,24 @@ pub(crate) fn compute_txt_expected(deployment_source: &[u8], host: &str) -> Stri
     general_purpose::STANDARD.encode(digest)
 }
 
+/// Deployment source representing "open to all": 64 zero bytes. A domain whose
+/// `_acu` TXT zone contains exactly this one marker authorizes any deployment.
+pub(crate) const ZERO_DEPLOYMENT_SOURCE: [u8; 64] = [0u8; 64];
+
+/// Decide whether the collected `_acu.<host>` TXT values authorize
+/// `deployment_source`. Open-domain rule: if there is exactly one TXT value and
+/// it equals `base64(sha256([0;64] || host))`, any source is authorized.
+/// Otherwise authorized iff some value equals
+/// `base64(sha256(deployment_source || host))` (current behavior).
+pub(crate) fn txt_authorizes(values: &[&[u8]], deployment_source: &[u8], host: &str) -> bool {
+    let open = compute_txt_expected(&ZERO_DEPLOYMENT_SOURCE, host);
+    if values.len() == 1 && values[0] == open.as_bytes() {
+        return true;
+    }
+    let expected = compute_txt_expected(deployment_source, host);
+    values.iter().any(|v| *v == expected.as_bytes())
+}
+
 /// ACME TLS-ALPN-01 challenge clients advertise this ALPN protocol id (RFC 8737).
 const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 
@@ -125,11 +143,53 @@ pub(crate) fn extract_sni_alpn(data: &[u8]) -> Option<(&str, bool)> {
 mod tests {
     use super::*;
 
+    const HOST: &str = "example.com";
+
     #[test]
     fn test_compute_txt_expected() {
         let hex_source = "9a1a0c52c2d7f23820caa7757acf049e07fcb68015919638feece41a4b0ee538";
         let source = hex::decode(hex_source).expect("Can decode hex");
-        let value = compute_txt_expected(source.as_slice(), "run.acurast-dev.papers.tech");
+        let value = compute_txt_expected(source.as_slice(), HOST);
         println!("TXT Value: {value}")
+    }
+
+    fn open_marker() -> String {
+        compute_txt_expected(&ZERO_DEPLOYMENT_SOURCE, HOST)
+    }
+
+    #[test]
+    fn open_marker_alone_authorizes_any_source() {
+        let open = open_marker();
+        let values: &[&[u8]] = &[open.as_bytes()];
+        // An arbitrary, non-zero deployment source is admitted.
+        assert!(txt_authorizes(values, &[7u8; 64], HOST));
+        assert!(txt_authorizes(values, b"some-other-source", HOST));
+    }
+
+    #[test]
+    fn open_marker_with_extra_entry_falls_back_to_per_source() {
+        let source = [7u8; 64];
+        let open = open_marker();
+        let source_val = compute_txt_expected(&source, HOST);
+        // open marker + unrelated record: not the exactly-one-open case.
+        let values: &[&[u8]] = &[open.as_bytes(), b"unrelated"];
+        assert!(!txt_authorizes(values, &source, HOST));
+        // ...but a matching per-source value among them is still accepted.
+        let values: &[&[u8]] = &[open.as_bytes(), source_val.as_bytes()];
+        assert!(txt_authorizes(values, &source, HOST));
+    }
+
+    #[test]
+    fn single_per_source_value_matches_only_that_source() {
+        let source = [7u8; 64];
+        let source_val = compute_txt_expected(&source, HOST);
+        let values: &[&[u8]] = &[source_val.as_bytes()];
+        assert!(txt_authorizes(values, &source, HOST));
+        assert!(!txt_authorizes(values, &[9u8; 64], HOST));
+    }
+
+    #[test]
+    fn empty_values_deny() {
+        assert!(!txt_authorizes(&[], &[7u8; 64], HOST));
     }
 }

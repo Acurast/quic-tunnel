@@ -5,8 +5,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tunnel_common::collect_h2_body;
 
 use crate::util::{
-    allowed_suffix, compute_txt_expected, custom_data_from_cert, pubkey_from_cert,
-    recover_identity_pubkey, register,
+    allowed_suffix, custom_data_from_cert, pubkey_from_cert, recover_identity_pubkey, register,
+    txt_authorizes,
 };
 use crate::{Agent, AgentMap, AuthHandler, PendingAlpnConn, PendingAlpnMap};
 
@@ -232,15 +232,13 @@ async fn h2_ctrl_exchange(
     if let Some(ref deployment_source) = auth_token {
         let host = domain.split_once('.').map(|x| x.1).unwrap_or("");
         let txt_name = format!("_acu.{}.", host);
-        let expected = compute_txt_expected(deployment_source, host);
         match resolver.txt_lookup(&txt_name).await {
             Ok(lookup) => {
-                let matched = lookup.iter().any(|r| {
-                    r.txt_data()
-                        .iter()
-                        .any(|d| d.as_ref() == expected.as_bytes())
-                });
-                if !matched {
+                let values: Vec<&[u8]> = lookup
+                    .iter()
+                    .flat_map(|r| r.txt_data().iter().map(|d| d.as_ref()))
+                    .collect();
+                if !txt_authorizes(&values, deployment_source, host) {
                     warn!(
                         "H2: TXT record mismatch for {} (client_id={})",
                         txt_name, id
