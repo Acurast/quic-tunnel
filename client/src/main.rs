@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use log::info;
+use log::{error, info};
 use std::{path::Path, sync::Arc};
 use tunnel_client::key::KeyAlgorithm;
 use tunnel_client::{TunnelClient, TunnelConfig, TunnelIdentityConfig, TunnelKey};
@@ -186,11 +186,23 @@ async fn main() -> Result<()> {
     let c = Arc::clone(&client);
     let tunnel = tokio::spawn(async move { c.run().await });
 
-    tokio::signal::ctrl_c().await?;
-    client.stop();
-    let _ = tunnel.await;
-
-    Ok(())
+    // Exit on Ctrl-C, or when the tunnel ends on its own (e.g. a terminal
+    // rejection by the relay) — surfacing its error so the process fails fast
+    // instead of hanging.
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            client.stop();
+            Ok(())
+        }
+        res = tunnel => match res {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                error!("tunnel stopped: {e:#}");
+                Err(e)
+            }
+            Err(e) => Err(anyhow::anyhow!("tunnel task join error: {e}")),
+        },
+    }
 }
 
 fn load_cert_pem(path: &str) -> Result<Option<String>> {
