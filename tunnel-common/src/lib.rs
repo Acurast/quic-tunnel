@@ -6,6 +6,8 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+pub const REJECT_UNAUTHORIZED: u32 = 1;
+
 /// OID for the custom data certificate extension.
 /// Private enterprise arc: 1.3.6.1.4.1.65535.1
 pub const CUSTOM_DATA_EXT_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65535, 1];
