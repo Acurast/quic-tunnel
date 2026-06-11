@@ -1,7 +1,7 @@
 use log::{debug, error, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tunnel_common::{ctrl_read, ctrl_write};
+use tunnel_common::{REJECT_UNAUTHORIZED, ctrl_read, ctrl_write};
 
 use crate::util::{
     allowed_suffix, custom_data_from_cert, pubkey_from_cert, recover_identity_pubkey, register,
@@ -60,7 +60,10 @@ async fn handle_quic_connection(
             Some(pk) => pk,
             None => {
                 warn!("QUIC: could not extract pubkey from {}", remote);
-                conn.close(quinn::VarInt::from_u32(1), b"");
+                conn.close(
+                    quinn::VarInt::from_u32(REJECT_UNAUTHORIZED),
+                    b"unauthorized: client certificate",
+                );
                 return None;
             }
         };
@@ -68,7 +71,10 @@ async fn handle_quic_connection(
             Ok(token) => token,
             Err(e) => {
                 warn!("QUIC: auth denied for {}: {}", remote, e);
-                conn.close(quinn::VarInt::from_u32(1), b"");
+                conn.close(
+                    quinn::VarInt::from_u32(REJECT_UNAUTHORIZED),
+                    b"unauthorized: auth handler rejected",
+                );
                 return None;
             }
         }
@@ -80,7 +86,10 @@ async fn handle_quic_connection(
     let (mut ctrl_send, mut ctrl_recv) = match conn.accept_bi().await {
         Ok(s) => s,
         Err(e) => {
-            error!("QUIC: failed to accept control stream from {}: {}", remote, e);
+            error!(
+                "QUIC: failed to accept control stream from {}: {}",
+                remote, e
+            );
             return None;
         }
     };
@@ -139,7 +148,10 @@ async fn quic_ctrl_exchange(
     let sig_bytes = match ctrl_read(ctrl_recv).await {
         Ok(s) => s,
         Err(e) => {
-            error!("QUIC: failed to read identity signature from {}: {}", remote, e);
+            error!(
+                "QUIC: failed to read identity signature from {}: {}",
+                remote, e
+            );
             return None;
         }
     };
@@ -166,6 +178,10 @@ async fn quic_ctrl_exchange(
             "QUIC: domain {} has no allowed suffix (allowed: {:?})",
             domain, domain_suffixes
         );
+        conn.close(
+            quinn::VarInt::from_u32(REJECT_UNAUTHORIZED),
+            b"unauthorized: domain suffix not allowed",
+        );
         return None;
     }
     debug!("QUIC: domain={}", domain);
@@ -184,6 +200,10 @@ async fn quic_ctrl_exchange(
                     warn!(
                         "QUIC: TXT record mismatch for {} (client_id={})",
                         txt_name, id
+                    );
+                    conn.close(
+                        quinn::VarInt::from_u32(REJECT_UNAUTHORIZED),
+                        b"unauthorized: deployment source not authorized by TXT",
                     );
                     return None;
                 }

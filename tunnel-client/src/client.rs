@@ -8,7 +8,7 @@ use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use sha2::{Digest, Sha256};
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -16,7 +16,8 @@ use std::{
 
 use tokio::{net::TcpStream, sync::Notify};
 use tunnel_common::{
-    CUSTOM_DATA_EXT_OID, H2Recv, H2Send, IO, NoVerify, build_alpn_acceptor, ctrl_read, ctrl_write,
+    CUSTOM_DATA_EXT_OID, H2Recv, H2Send, IO, NoVerify, REJECT_UNAUTHORIZED, build_alpn_acceptor,
+    ctrl_read, ctrl_write,
 };
 
 /// Maximum number of consecutive failed reconnect attempts before the
@@ -72,6 +73,7 @@ pub struct TunnelClient {
     secondary: Option<Connection>,
     stop: Arc<Notify>,
     stopped: Arc<AtomicBool>,
+    fatal: Mutex<Option<String>>,
 }
 
 struct Connection {
@@ -98,13 +100,7 @@ impl TunnelClient {
     /// Creates a new client. Synchronous — no network operations.
     /// `client_id` and `url` are available immediately.
     pub fn new(config: TunnelConfig) -> Result<Self> {
-        // Multiple rustls crypto providers (ring + aws-lc-rs) can be pulled in by
-        // transitive deps, leaving no auto-detected default. Install ring explicitly;
-        // ignore Err (already installed by another caller).
         let _ = rustls::crypto::ring::default_provider().install_default();
-
-        // The identity-recovery protocol requires P-256 on both keypairs (server
-        // recovers the pubkey from a recoverable ECDSA signature).
         if config.primary_identity.keypair.algorithm() != crate::key::KeyAlgorithm::EcdsaP256 {
             anyhow::bail!("primary_identity keypair must be ECDSA P-256");
         }
@@ -114,9 +110,6 @@ impl TunnelClient {
             }
         }
 
-        // Primary connection: identity = primary_identity (drives id, ACME CSR,
-        // domain signature). Agent cert is signed by self_signed_identity when
-        // configured, otherwise by primary_identity.
         let primary_agent_keypair = match &config.self_signed_identity {
             Some(sec) => Arc::clone(&sec.keypair),
             None => Arc::clone(&config.primary_identity.keypair),
@@ -128,10 +121,6 @@ impl TunnelClient {
             config.primary_identity.cert_extension.as_deref(),
             /* need_csr */ true,
         )?;
-        // Secondary connection: only exists when self_signed_identity is
-        // configured. Both the agent cert and the identity (id derivation +
-        // domain signature) are bound to self_signed_identity, so the secondary
-        // gets a distinct client_id from the primary and routes to its own URL.
         let secondary = match &config.self_signed_identity {
             Some(sec) => Some(build_connection(
                 Arc::clone(&sec.keypair),
@@ -149,6 +138,7 @@ impl TunnelClient {
             secondary,
             stop: Arc::new(Notify::new()),
             stopped: Arc::new(AtomicBool::new(false)),
+            fatal: Mutex::new(None),
         })
     }
 
@@ -169,6 +159,24 @@ impl TunnelClient {
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
         self.stop.notify_waiters();
+    }
+
+    /// Record a terminal rejection (first one wins) and stop the tunnel. `run()`
+    /// turns a recorded reason into an error so the foreign side gets `Failed`.
+    fn fail(&self, reason: String) {
+        {
+            // Recover from a poisoned lock rather than panicking.
+            let mut g = self.fatal.lock().unwrap_or_else(|e| e.into_inner());
+            if g.is_none() {
+                *g = Some(reason);
+            }
+        }
+        self.stop();
+    }
+
+    /// Take the recorded terminal-rejection reason, if any.
+    fn take_fatal(&self) -> Option<String> {
+        self.fatal.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
     /// Runs the tunnel. Resolves when `stop()` is called.
@@ -225,9 +233,17 @@ impl TunnelClient {
             }
         }
 
-        self.stop.notified().await;
+        while !self.stopped.load(Ordering::SeqCst) {
+            tokio::select! {
+                _ = self.stop.notified() => break,
+                _ = tokio::time::sleep(RECONNECT_BASE_BACKOFF) => {}
+            }
+        }
         for h in handles {
             h.abort();
+        }
+        if let Some(reason) = self.take_fatal() {
+            anyhow::bail!("tunnel rejected by relay: {reason}");
         }
         Ok(())
     }
@@ -342,6 +358,38 @@ impl TunnelClient {
         &self,
         conn_m: &Connection,
         conn: quinn::Connection,
+        server_addr: &str,
+        provisioner: Option<Arc<CertProvisioner>>,
+        tag: &str,
+        target_addr: &str,
+        ctrl_completed: Arc<AtomicBool>,
+    ) -> Result<()> {
+        let result = self
+            .quic_loop_inner(
+                conn_m,
+                &conn,
+                server_addr,
+                provisioner,
+                tag,
+                target_addr,
+                ctrl_completed,
+            )
+            .await;
+        if let Some(quinn::ConnectionError::ApplicationClosed(close)) = conn.close_reason() {
+            if close.error_code == quinn::VarInt::from_u32(REJECT_UNAUTHORIZED) {
+                let reason = String::from_utf8_lossy(&close.reason).into_owned();
+                warn!("QUIC[{tag}/{server_addr}]: rejected by relay: {reason}");
+                self.fail(reason);
+            }
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn quic_loop_inner(
+        &self,
+        conn_m: &Connection,
+        conn: &quinn::Connection,
         server_addr: &str,
         provisioner: Option<Arc<CertProvisioner>>,
         tag: &str,
