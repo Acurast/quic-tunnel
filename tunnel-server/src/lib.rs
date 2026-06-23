@@ -141,10 +141,18 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     let agents: AgentMap = Arc::new(DashMap::new());
     let server_challenge: ServerChallenge = Arc::new(tokio::sync::Mutex::new(None));
 
-    // Bind the public listener before cert selection: the server's own ACME
-    // TLS-ALPN-01 challenge must be serviceable here while provision_acme_cert()
-    // runs. The public branch is a no-op until clients register (agents empty).
+    // Start accepting on the public listener before cert selection: the server's
+    // own ACME TLS-ALPN-01 challenge must be *serviced* (accepted + handshaked)
+    // while provision_acme_cert() runs, otherwise a cold provision deadlocks —
+    // binding alone leaves the connection in the kernel backlog with no accept().
+    // The public branch is a no-op until clients register (agents empty).
     let pub_listener = TcpListener::bind(&pub_addr).await?;
+    let pub_handle = tokio::spawn(public::run_public_listener(
+        pub_listener,
+        agents.clone(),
+        pending_alpn.clone(),
+        server_challenge.clone(),
+    ));
 
     let cert_paths = cert::determine_cert(&config, &server_challenge).await?;
     let server_tls = cert::build_server_tls_config(&config, &cert_paths, &server_challenge)?;
@@ -181,5 +189,5 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         resolver,
     ));
 
-    public::run_public_listener(pub_listener, agents, pending_alpn, server_challenge).await
+    pub_handle.await?
 }
