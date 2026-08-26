@@ -1,13 +1,53 @@
-include:
-  - project: "papers/papers-internal/internal"
-    file: "/.base-gitlab-ci.yml"
+# CI for the quic-tunnel relay.
+#
+# Self-contained on purpose: the papers-internal base template and its
+# eu.gcr.io / $GOOGLE_TAG convention are not included. The relay is deployed by
+# docker compose on hosts that already authenticate to
+# registry.gitlab.papers.tech for the proxy-backend images, so pushing to GCR
+# would mean putting gcloud credentials on those hosts. `default:` and
+# `workflow:` below replace what the template used to provide.
+
+default:
+  image: docker:27
+  tags:
+    - docker
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
 
 stages:
   - build
 
-build:
+variables:
+  SERVER_IMAGE: $CI_REGISTRY_IMAGE/server
+
+# Builds the relay (`server` target) and pushes it. This is also the compile
+# check: the server image is produced from the full `cargo build`, so a broken
+# build fails the job — the old `--target build` job did the same work without
+# producing anything runnable.
+#
+# --platform is explicit because every deploy target is amd64. An arm64 image
+# (built by hand on a Mac, say) fails at pull time with
+# "no matching manifest for linux/amd64".
+#
+# The `client` target shares the same build stage, so publishing it too would be
+# a near-free two-line addition if the smoke env ever wants a registry image
+# instead of building from a local context.
+build-server:
   stage: build
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
   script:
-    - docker build --target build -t $GOOGLE_TAG .
-  tags:
-    - docker
+    - docker build --platform linux/amd64 --target server -t "$SERVER_IMAGE:$CI_COMMIT_SHA" .
+    - docker push "$SERVER_IMAGE:$CI_COMMIT_SHA"
+    # Ref-slug tag so a deploy can pin without knowing the SHA:
+    # TUNNEL_RELAY_TAG=main, or =my-branch while testing a POC.
+    - docker tag "$SERVER_IMAGE:$CI_COMMIT_SHA" "$SERVER_IMAGE:$CI_COMMIT_REF_SLUG"
+    - docker push "$SERVER_IMAGE:$CI_COMMIT_REF_SLUG"
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        docker tag "$SERVER_IMAGE:$CI_COMMIT_SHA" "$SERVER_IMAGE:latest"
+        docker push "$SERVER_IMAGE:latest"
+      fi
