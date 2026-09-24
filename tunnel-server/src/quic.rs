@@ -1,33 +1,31 @@
-use log::{debug, error, warn};
+use log::{debug, warn};
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tunnel_common::{REJECT_UNAUTHORIZED, ctrl_read, ctrl_write};
+use tokio::sync::OwnedSemaphorePermit;
+use tunnel_common::{CLOSE_TIMEOUT, REJECT_UNAUTHORIZED, ctrl_read, ctrl_write};
 
+use crate::admission::{AUTH_EXCHANGE_TIMEOUT, Admission, KEY_AUTH_TIMEOUT};
 use crate::util::{
     allowed_suffix, custom_data_from_cert, pubkey_from_cert, recover_identity_pubkey, register,
     txt_authorizes,
 };
-use crate::{Agent, AgentMap, AuthHandler, PendingAlpnConn, PendingAlpnMap};
+use crate::{
+    Agent, ListenerCtx, PendingAlpnConn, PendingAlpnMap, pending_alpn_insert, pending_alpn_remove,
+};
 
-pub(crate) async fn run_quic_listener(
-    endpoint: quinn::Endpoint,
-    agents: AgentMap,
-    pending: PendingAlpnMap,
-    domain_suffixes: Arc<Vec<String>>,
-    auth_handler: Option<AuthHandler>,
-    resolver: Arc<hickory_resolver::TokioAsyncResolver>,
-) {
+pub(crate) async fn run_quic_listener(endpoint: quinn::Endpoint, ctx: ListenerCtx) {
+    let mut admission = Admission::new("QUIC");
     while let Some(incoming) = endpoint.accept().await {
         let remote = incoming.remote_address();
+        let Some(permit) = admission.try_admit(remote) else {
+            incoming.refuse();
+            continue;
+        };
         debug!("QUIC: incoming connection from {}", remote);
         tokio::spawn(handle_quic_connection(
             incoming,
             remote,
-            agents.clone(),
-            pending.clone(),
-            domain_suffixes.clone(),
-            auth_handler.clone(),
-            resolver.clone(),
+            ctx.clone(),
+            permit,
         ));
     }
 }
@@ -35,11 +33,8 @@ pub(crate) async fn run_quic_listener(
 async fn handle_quic_connection(
     incoming: quinn::Incoming,
     remote: SocketAddr,
-    agents: AgentMap,
-    pending: PendingAlpnMap,
-    domain_suffixes: Arc<Vec<String>>,
-    auth_handler: Option<AuthHandler>,
-    resolver: Arc<hickory_resolver::TokioAsyncResolver>,
+    ctx: ListenerCtx,
+    permit: OwnedSemaphorePermit,
 ) -> Option<()> {
     let conn = match incoming.await {
         Ok(c) => c,
@@ -55,7 +50,7 @@ async fn handle_quic_connection(
     if let Some(ref att) = custom_data {
         debug!("QUIC: {} custom data ({} bytes)", remote, att.len());
     }
-    let auth_token: Option<Vec<u8>> = if let Some(ref handler) = auth_handler {
+    let auth_token: Option<Vec<u8>> = if let Some(ref handler) = ctx.auth_handler {
         let pubkey = match pubkey_from_cert(first_cert) {
             Some(pk) => pk,
             None => {
@@ -83,28 +78,69 @@ async fn handle_quic_connection(
     };
     debug!("QUIC: {} starting control exchange", remote);
 
-    let (mut ctrl_send, mut ctrl_recv) = match conn.accept_bi().await {
-        Ok(s) => s,
-        Err(e) => {
-            error!(
-                "QUIC: failed to accept control stream from {}: {}",
-                remote, e
+    let (mut ctrl_send, mut ctrl_recv, id) =
+        match tokio::time::timeout(AUTH_EXCHANGE_TIMEOUT, async {
+            let (ctrl_send, mut ctrl_recv) = match conn.accept_bi().await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        "QUIC: failed to accept control stream from {}: {}",
+                        remote, e
+                    );
+                    return None;
+                }
+            };
+            let id = quic_auth_exchange(
+                &conn,
+                &mut ctrl_recv,
+                remote,
+                &ctx.domain_suffixes,
+                auth_token,
+                &ctx.resolver,
+            )
+            .await?;
+            Some((ctrl_send, ctrl_recv, id))
+        })
+        .await
+        {
+            Ok(Some(v)) => v,
+            Ok(None) => return None,
+            Err(_) => {
+                warn!(
+                    "QUIC: authentication exchange from {} timed out after {:?}",
+                    remote, AUTH_EXCHANGE_TIMEOUT
+                );
+                conn.close(
+                    quinn::VarInt::from_u32(CLOSE_TIMEOUT),
+                    b"authentication exchange timeout",
+                );
+                return None;
+            }
+        };
+
+    // Authenticated: stop counting against the unauthenticated budget.
+    drop(permit);
+
+    // Step 3: key_auth — empty means the cert is cached, non-empty means an ACME
+    // challenge is in progress.
+    let key_auth = match tokio::time::timeout(KEY_AUTH_TIMEOUT, ctrl_read(&mut ctrl_recv)).await {
+        Ok(Ok(k)) => k,
+        Ok(Err(e)) => {
+            warn!("QUIC: failed to read key_auth from {}: {}", id, e);
+            return None;
+        }
+        Err(_) => {
+            warn!(
+                "QUIC: {} did not send key_auth within {:?}",
+                id, KEY_AUTH_TIMEOUT
             );
             return None;
         }
     };
 
-    let id = quic_ctrl_exchange(
-        &conn,
-        &mut ctrl_send,
-        &mut ctrl_recv,
-        remote,
-        &pending,
-        &domain_suffixes,
-        auth_token,
-        &resolver,
-    )
-    .await?;
+    if !key_auth.is_empty() {
+        quic_acme_wait(&conn, &mut ctrl_send, &mut ctrl_recv, &id, &ctx.pending).await?;
+    }
     drop((ctrl_send, ctrl_recv));
 
     let done = {
@@ -113,17 +149,17 @@ async fn handle_quic_connection(
             let _ = conn.closed().await;
         }
     };
-    register(&agents, id, Agent::Quic(conn), done).await;
+    register(&ctx.agents, id, Agent::Quic(conn), done).await;
     Some(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn quic_ctrl_exchange(
+/// Reads and verifies the peer's identity: the announced domain, the recoverable
+/// signature binding it, the suffix allowlist and the DNS TXT authorization.
+/// Returns the `client_id`. The key-auth frame is read by the caller.
+async fn quic_auth_exchange(
     conn: &quinn::Connection,
-    ctrl_send: &mut quinn::SendStream,
     ctrl_recv: &mut quinn::RecvStream,
     remote: SocketAddr,
-    pending: &PendingAlpnMap,
     domain_suffixes: &[String],
     auth_token: Option<Vec<u8>>,
     resolver: &hickory_resolver::TokioAsyncResolver,
@@ -132,14 +168,14 @@ async fn quic_ctrl_exchange(
     let domain_bytes = match ctrl_read(ctrl_recv).await {
         Ok(d) => d,
         Err(e) => {
-            error!("QUIC: failed to read domain from {}: {}", remote, e);
+            warn!("QUIC: failed to read domain from {}: {}", remote, e);
             return None;
         }
     };
     let domain = match std::str::from_utf8(&domain_bytes) {
         Ok(d) => d.to_string(),
         Err(e) => {
-            error!("QUIC: invalid domain from {}: {}", remote, e);
+            warn!("QUIC: invalid domain from {}: {}", remote, e);
             return None;
         }
     };
@@ -148,7 +184,7 @@ async fn quic_ctrl_exchange(
     let sig_bytes = match ctrl_read(ctrl_recv).await {
         Ok(s) => s,
         Err(e) => {
-            error!(
+            warn!(
                 "QUIC: failed to read identity signature from {}: {}",
                 remote, e
             );
@@ -158,9 +194,13 @@ async fn quic_ctrl_exchange(
     let pubkey = match recover_identity_pubkey(&domain, &sig_bytes) {
         Some(pk) => pk,
         None => {
-            error!(
+            warn!(
                 "QUIC: identity signature does not bind to id in domain {} from {}",
                 domain, remote
+            );
+            conn.close(
+                quinn::VarInt::from_u32(REJECT_UNAUTHORIZED),
+                b"unauthorized: identity signature",
             );
             return None;
         }
@@ -174,7 +214,7 @@ async fn quic_ctrl_exchange(
     );
 
     if !allowed_suffix(&domain, domain_suffixes) {
-        error!(
+        warn!(
             "QUIC: domain {} has no allowed suffix (allowed: {:?})",
             domain, domain_suffixes
         );
@@ -215,30 +255,30 @@ async fn quic_ctrl_exchange(
         }
     }
 
-    // Step 3: read key_auth — empty means cert is cached, non-empty means ACME challenge in progress
-    let key_auth = match ctrl_read(ctrl_recv).await {
-        Ok(k) => k,
-        Err(e) => {
-            error!("QUIC: failed to read key_auth from {}: {}", id, e);
-            return None;
-        }
-    };
-
-    if !key_auth.is_empty() {
-        // Register this connection so handle_acme can proxy LE's port-443 connections
-        pending.insert(id.clone(), PendingAlpnConn::Quic(conn.clone()));
-        // ACK so client knows it can start handling ALPN challenge streams
-        if let Err(e) = ctrl_write(ctrl_send, b"ack").await {
-            error!("QUIC: failed to send ACK to {}: {}", id, e);
-            pending.remove(&id);
-            return None;
-        }
-        // Wait for client to signal ACME finalize is complete
-        if let Err(e) = ctrl_read(ctrl_recv).await {
-            error!("QUIC: failed to read done signal from {}: {}", id, e);
-        }
-        pending.remove(&id);
-    }
-
     Some(id)
+}
+
+/// Services the client's TLS-ALPN-01 challenge: registers the connection so
+/// `handle_acme` can proxy Let's Encrypt's port-443 connections through it, then
+/// blocks — unbounded, the ACME server drives it — until the client reports done.
+async fn quic_acme_wait(
+    conn: &quinn::Connection,
+    ctrl_send: &mut quinn::SendStream,
+    ctrl_recv: &mut quinn::RecvStream,
+    id: &str,
+    pending: &PendingAlpnMap,
+) -> Option<()> {
+    let token = pending_alpn_insert(pending, id, PendingAlpnConn::Quic(conn.clone()));
+    // ACK so client knows it can start handling ALPN challenge streams
+    if let Err(e) = ctrl_write(ctrl_send, b"ack").await {
+        warn!("QUIC: failed to send ACK to {}: {}", id, e);
+        pending_alpn_remove(pending, id, token);
+        return None;
+    }
+    // Wait for client to signal ACME finalize is complete
+    if let Err(e) = ctrl_read(ctrl_recv).await {
+        warn!("QUIC: failed to read done signal from {}: {}", id, e);
+    }
+    pending_alpn_remove(pending, id, token);
+    Some(())
 }

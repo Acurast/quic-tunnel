@@ -1,13 +1,13 @@
-use log::{debug, error};
+use log::{debug, error, warn};
 use tokio::net::TcpStream;
 use tunnel_common::{H2Recv, H2Send, IO};
 
+use crate::public::TUNNEL_OPEN_TIMEOUT;
 use crate::{PendingAlpnConn, PendingAlpnMap, ServerChallenge};
 
-/// Handle one ACME TLS-ALPN-01 challenge connection (ALPN `acme-tls/1`). The
-/// SNI `host` has already been extracted by the router. Serves the server's own
-/// challenge if it matches, otherwise proxies the raw TLS bytes to the tunnel
-/// client registered for the challenge.
+/// Handles one ACME TLS-ALPN-01 challenge connection for the already-extracted
+/// SNI `host`: serves the server's own challenge when it matches, otherwise
+/// proxies the raw TLS bytes to the tunnel client registered for it.
 pub(crate) async fn handle_acme(
     mut tcp: TcpStream,
     host: &str,
@@ -31,16 +31,24 @@ pub(crate) async fn handle_acme(
     let client_id = host.split('.').next()?;
     debug!("ALPN: challenge for client_id={}", client_id);
 
-    let conn = pending.get(client_id)?.clone();
+    let conn = pending.get(client_id)?.conn.clone();
     match conn {
         PendingAlpnConn::Quic(qconn) => {
-            let (send, recv) = match qconn.open_bi().await {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("ALPN: failed to open QUIC stream for {}: {}", client_id, e);
-                    return None;
-                }
-            };
+            let (send, recv) =
+                match tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, qconn.open_bi()).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        error!("ALPN: failed to open QUIC stream for {}: {}", client_id, e);
+                        return None;
+                    }
+                    Err(_) => {
+                        warn!(
+                            "ALPN: opening a QUIC stream for {} timed out after {:?}",
+                            client_id, TUNNEL_OPEN_TIMEOUT
+                        );
+                        return None;
+                    }
+                };
             let mut tunnel = IO::new(recv, send);
             let _ = tokio::io::copy_bidirectional(&mut tcp, &mut tunnel).await;
         }
@@ -57,13 +65,21 @@ pub(crate) async fn handle_acme(
                     return None;
                 }
             };
-            let mut h2_stream = IO::new(
-                H2Recv {
-                    r: resp_future.await.ok()?.into_body(),
-                    buf: bytes::Bytes::new(),
-                },
-                H2Send(send),
-            );
+            let body = match tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, resp_future).await {
+                Ok(Ok(r)) => r.into_body(),
+                Ok(Err(e)) => {
+                    error!("ALPN: H2 stream for {} failed: {}", client_id, e);
+                    return None;
+                }
+                Err(_) => {
+                    warn!(
+                        "ALPN: opening an H2 stream for {} timed out after {:?}",
+                        client_id, TUNNEL_OPEN_TIMEOUT
+                    );
+                    return None;
+                }
+            };
+            let mut h2_stream = IO::new(H2Recv::new(body), H2Send(send));
             let _ = tokio::io::copy_bidirectional(&mut tcp, &mut h2_stream).await;
         }
     }

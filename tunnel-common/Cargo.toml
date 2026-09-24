@@ -13,3 +13,7 @@ anyhow = { workspace = true }
 sha2 = { workspace = true }
 h2 = { workspace = true }
 bytes = { workspace = true }
+instant-acme = { workspace = true }
+
+[dev-dependencies]
+http = { workspace = true }

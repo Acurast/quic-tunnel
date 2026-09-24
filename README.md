@@ -11,7 +11,7 @@ A fast, modern reverse tunnel that exposes your local services to the internet. 
 
 ## Key Features
 
-- **QUIC-first with HTTP/2 fallback** — Uses QUIC (UDP) by default for best performance, automatically falls back to HTTP/2 (TCP) when UDP is blocked
+- **QUIC-first with HTTP/2 fallback** — Uses QUIC (UDP) by default for best performance, automatically falls back to HTTP/2 (TCP) when UDP is blocked, and retries QUIC on every reconnect so a transient UDP failure does not downgrade the transport for good
 - **Head-of-line blocking mitigation** — Independent QUIC streams mean packet loss on one connection doesn't stall others
 - **Connection pooling** — Multiple parallel connections in HTTP/2 mode for better throughput
 - **TLS everywhere** — End-to-end encryption with publicly trusted Let's Encrypt certificates (ACME) on both server and per-client endpoints
@@ -174,21 +174,31 @@ While not as granular as QUIC (where each stream is independent), connection poo
 
 ### HTTP/2 Mode (Fallback)
 
-Automatically activates when QUIC connection fails (e.g., UDP blocked by firewall).
+Automatically activates when a QUIC connection attempt fails (e.g., UDP blocked
+by firewall). The fallback is scoped to that attempt: the next reconnect tries
+QUIC first again, so a network that starts passing UDP is picked up without
+restarting the client.
 
 - **Protocol**: HTTP/2 over TLS/TCP
 - **Streams**: HTTP/2 multiplexed streams
 - **Connection Pool**: Multiple parallel connections (configurable via `--pool-size`)
 - **Best for**: Networks that block UDP (corporate firewalls, some mobile networks)
 
-The client automatically detects UDP availability and falls back seamlessly:
+The client automatically detects UDP availability and falls back seamlessly,
+one attempt at a time:
 
 ```
-Attempt QUIC ──▶ Success? ──▶ Use QUIC
-                    │
-                    ▼ Failed
-              Use HTTP/2 pool
+  ┌──▶ Attempt QUIC ──▶ Success? ──▶ Use QUIC
+  │                        │            │
+  │                        ▼ Failed     │ connection lost
+  │     HTTP/2 pool, this attempt only  │
+  │                        │ pool down  │
+  └───── backoff ──────────┴────────────┘
 ```
+
+Each pass that never carries traffic costs one attempt of the reconnect budget,
+whichever transport it was spent on; a session that *was* up and then dropped
+resets it.
 
 ## Building
 

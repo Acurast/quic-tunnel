@@ -87,6 +87,98 @@ pub trait TunnelKey: Send + Sync + Debug {
     fn sign(&self, msg: &[u8]) -> Result<Vec<u8>>;
 }
 
+/// Local keypair that holds its own private key material, for the callers
+/// whose key never leaves this process: the CLI's PKCS#8 file, the tests, and
+/// job-supplied bytes arriving over the FFI.
+pub struct RcgenKey {
+    keypair: rcgen::KeyPair,
+    algorithm: KeyAlgorithm,
+    raw_pub: Vec<u8>,
+}
+
+impl RcgenKey {
+    /// Generates a fresh keypair for `alg`.
+    pub fn generate(alg: KeyAlgorithm) -> Result<Self> {
+        Ok(Self::wrap(
+            rcgen::KeyPair::generate_for(alg.rcgen_sig_alg())?,
+            alg,
+        ))
+    }
+
+    /// Loads a PKCS#8 DER keypair, inferring the algorithm from it.
+    pub fn from_pkcs8_der(der: &[u8]) -> Result<Self> {
+        let keypair = rcgen::KeyPair::try_from(der)?;
+        let algorithm = if keypair.is_compatible(&rcgen::PKCS_ECDSA_P256_SHA256) {
+            KeyAlgorithm::EcdsaP256
+        } else if keypair.is_compatible(&rcgen::PKCS_ED25519) {
+            KeyAlgorithm::Ed25519
+        } else {
+            anyhow::bail!("unsupported keypair algorithm in PKCS#8 DER");
+        };
+        Ok(Self::wrap(keypair, algorithm))
+    }
+
+    /// Builds an Ed25519 key from a raw 32-byte seed.
+    pub fn from_ed25519_seed(seed: &[u8]) -> Result<Self> {
+        if seed.len() != 32 {
+            anyhow::bail!("ed25519 seed must be 32 bytes, got {}", seed.len());
+        }
+        let der = rustls::pki_types::PrivatePkcs8KeyDer::from(ed25519_seed_to_pkcs8(seed));
+        Ok(Self::wrap(
+            rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&der, &rcgen::PKCS_ED25519)?,
+            KeyAlgorithm::Ed25519,
+        ))
+    }
+
+    fn wrap(keypair: rcgen::KeyPair, algorithm: KeyAlgorithm) -> Self {
+        let raw_pub = keypair.public_key_raw().to_vec();
+        Self {
+            keypair,
+            algorithm,
+            raw_pub,
+        }
+    }
+}
+
+/// Prints the algorithm only: `rcgen::KeyPair`'s own `Debug` can serialize the
+/// private key, and this type ends up inside logged config structs.
+impl Debug for RcgenKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RcgenKey")
+            .field("algorithm", &self.algorithm)
+            .finish()
+    }
+}
+
+impl TunnelKey for RcgenKey {
+    fn algorithm(&self) -> KeyAlgorithm {
+        self.algorithm
+    }
+    fn public_key_raw(&self) -> Vec<u8> {
+        self.raw_pub.clone()
+    }
+    fn sign(&self, msg: &[u8]) -> Result<Vec<u8>> {
+        RcgenSigningKey::sign(&self.keypair, msg)
+            .map_err(|e| anyhow::anyhow!("rcgen sign failed: {e}"))
+    }
+}
+
+/// Wraps a raw 32-byte Ed25519 seed in a PKCS#8 DER blob suitable for rcgen.
+fn ed25519_seed_to_pkcs8(seed: &[u8]) -> Vec<u8> {
+    use yasna::models::ObjectIdentifier;
+    let oid = ObjectIdentifier::from_slice(KeyAlgorithm::Ed25519.spki_oid());
+    yasna::construct_der(|w| {
+        w.write_sequence(|w| {
+            w.next().write_u8(0);
+            w.next().write_sequence(|w| {
+                w.next().write_oid(&oid);
+            });
+            let inner = yasna::construct_der(|w| w.write_bytes(seed));
+            w.next().write_bytes(&inner);
+        });
+    })
+}
+
 /// Build the DER-encoded SubjectPublicKeyInfo from raw key bytes + algorithm.
 pub(crate) fn build_spki(alg: KeyAlgorithm, raw_public_key: &[u8]) -> Vec<u8> {
     use yasna::models::ObjectIdentifier;
