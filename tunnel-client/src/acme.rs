@@ -41,6 +41,31 @@ struct CacheEntry {
     renew_at: Instant,
 }
 
+const RATE_LIMITED: &str = "urn:ietf:params:acme:error:rateLimited";
+
+/// When the CA allows the next order, if `err` is its rate-limit problem.
+pub fn rate_limited_until(err: &anyhow::Error) -> Option<SystemTime> {
+    let problem = err
+        .chain()
+        .find_map(|e| match e.downcast_ref::<instant_acme::Error>() {
+            Some(instant_acme::Error::Api(problem)) => Some(problem),
+            _ => None,
+        })?;
+    if problem.r#type.as_deref() != Some(RATE_LIMITED) {
+        return None;
+    }
+    retry_after_in(problem.detail.as_deref()?)
+}
+
+/// Parses Let's Encrypt's `retry after YYYY-MM-DD HH:MM:SS UTC` out of a problem detail.
+fn retry_after_in(detail: &str) -> Option<SystemTime> {
+    let format =
+        time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second] UTC");
+    let (_, rest) = detail.split_once("retry after ")?;
+    let at = time::PrimitiveDateTime::parse(rest.get(..23)?, format).ok()?;
+    Some(at.assume_utc().into())
+}
+
 /// Fallback renewal point for an issued cert whose validity cannot be read.
 const DEFAULT_RENEW_AFTER: Duration = Duration::from_secs(60 * 24 * 3600);
 
@@ -511,6 +536,39 @@ mod tests {
         p.seed(DOMAIN, key.public_key_raw(), cert(&[DOMAIN], &key, 20, 90))
             .await;
         assert!(!cached(&p).await);
+    }
+
+    fn api_error(r#type: &str, detail: &str) -> anyhow::Error {
+        let problem: instant_acme::Problem = serde_json::from_value(serde_json::json!({
+            "type": r#type,
+            "detail": detail,
+            "status": 429,
+        }))
+        .unwrap();
+        anyhow::Error::from(instant_acme::Error::Api(problem)).context("ACME setup")
+    }
+
+    #[test]
+    fn rate_limited_until_reads_lets_encrypt_retry_after() {
+        let err = api_error(
+            RATE_LIMITED,
+            "too many failed authorizations (5) for \"x.test.acu.run\" in the last 1h0m0s, \
+             retry after 2026-09-24 13:00:43 UTC: see https://letsencrypt.org/docs/rate-limits/",
+        );
+        assert_eq!(
+            rate_limited_until(&err),
+            Some(UNIX_EPOCH + Duration::from_secs(1_790_254_843))
+        );
+    }
+
+    #[test]
+    fn rate_limited_until_ignores_other_problems() {
+        let err = api_error(
+            "urn:ietf:params:acme:error:connection",
+            "retry after 2026-09-24 13:00:43 UTC",
+        );
+        assert_eq!(rate_limited_until(&err), None);
+        assert_eq!(rate_limited_until(&anyhow::anyhow!("boom")), None);
     }
 
     #[test]

@@ -1109,6 +1109,30 @@ fn assert_never_established(events: &Events) {
     );
 }
 
+/// Each failed attempt but the last, which gives up instead, was reported with
+/// its number and backoff, and a cause containing `cause`.
+fn assert_attempts_reported(events: &Events, tag: &str, retry_in: &[Duration], cause: &str) {
+    let seen: Vec<(u32, Duration)> = events
+        .all()
+        .into_iter()
+        .filter_map(|e| match e {
+            ConnectionEvent::AttemptFailed {
+                tag: t,
+                attempt,
+                cause: c,
+                retry_in,
+                ..
+            } if t == tag => {
+                assert!(c.contains(cause), "cause {c:?} lacks {cause:?}");
+                Some((attempt, retry_in))
+            }
+            _ => None,
+        })
+        .collect();
+    let expected: Vec<(u32, Duration)> = (1..).zip(retry_in.iter().copied()).collect();
+    assert_eq!(seen, expected, "{tag} attempt reports");
+}
+
 /// The default transport: QUIC cannot connect, the H2 fallback cannot come up
 /// either, and once the shared budget is spent `run()` has to surface that.
 #[tokio::test(flavor = "multi_thread")]
@@ -1120,6 +1144,12 @@ async fn run_gives_up_when_relay_is_unreachable() -> Result<()> {
     let reason = format!("TUNNEL[SEC/{addr}]: giving up after 3 failed attempts");
     run_until_gave_up(client, &addr, &reason, &events).await;
     assert_never_established(&events);
+    assert_attempts_reported(
+        &events,
+        "SEC",
+        &[Duration::from_millis(100), Duration::from_millis(200)],
+        "",
+    );
     assert_logged(&addr, "falling back to H2 for this attempt");
     Ok(())
 }
@@ -1188,6 +1218,14 @@ async fn rejected_by_relay_retries_then_gives_up(force_h2: bool) -> Result<()> {
     );
     run_until_gave_up(client, &server_addr, &reason, &events).await;
     assert_never_established(&events);
+    for tag in ["PRI", "SEC"] {
+        assert_attempts_reported(
+            &events,
+            tag,
+            &[Duration::from_millis(200), Duration::from_millis(200)],
+            "rejected by relay: unauthorized",
+        );
+    }
     let needle = if force_h2 {
         format!("H2[SEC/{server_addr}#0]: rejected by relay")
     } else {

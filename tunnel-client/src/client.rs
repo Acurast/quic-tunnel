@@ -1,4 +1,4 @@
-use crate::acme::{CertProvisioner, PrepareResult};
+use crate::acme::{CertProvisioner, PrepareResult, rate_limited_until};
 use crate::key::{KeyAlgorithm, RcgenRemoteKey, RustlsRemoteKey, TunnelKey};
 use anyhow::Result;
 use log::{debug, error, info, warn};
@@ -11,7 +11,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use tokio::{net::TcpStream, sync::watch};
@@ -145,6 +145,17 @@ pub enum ConnectionEvent {
         server_addr: String,
         transport: Transport,
         cause: String,
+    },
+    /// One attempt of a connection that is not established failed before
+    /// carrying traffic; its reconnect loop retries after `retry_in`.
+    AttemptFailed {
+        tag: String,
+        server_addr: String,
+        /// The failed attempt's number, as it appears in the logs.
+        attempt: u32,
+        cause: String,
+        /// Backoff, or the ACME CA's retry time when it rate-limited the attempt.
+        retry_in: Duration,
     },
     /// This connection's task ended for good (reconnect budget exhausted, or
     /// panic). No further retries.
@@ -299,15 +310,40 @@ impl PoolLiveness {
 /// reconnect loop takes it after each session.
 type RejectSlot = watch::Sender<Option<String>>;
 
+/// Why one attempt never carried traffic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttemptFailure {
+    cause: String,
+    /// Set when the ACME CA rate-limited the attempt: no retry succeeds before it.
+    rate_limited_until: Option<SystemTime>,
+}
+
+impl AttemptFailure {
+    fn new(cause: impl Into<String>) -> Self {
+        Self {
+            cause: cause.into(),
+            rate_limited_until: None,
+        }
+    }
+
+    fn from_error(e: &anyhow::Error) -> Self {
+        Self {
+            cause: format!("{e:#}"),
+            rate_limited_until: rate_limited_until(e),
+        }
+    }
+}
+
 /// How one session — a QUIC connection or an H2 pool run — ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionOutcome {
     /// `stop()` was called. Terminal: the connection task returns `Ok(())`.
     Stopped,
     /// The session carried traffic and then went down. Resets the retry budget.
     Lost,
-    /// Nothing ever completed the control exchange. Counts as one failed attempt.
-    NeverUp,
+    /// Nothing ever completed the control exchange. Counts as one failed
+    /// attempt unless rate-limited.
+    NeverUp(AttemptFailure),
 }
 
 /// Attempts-and-backoff bookkeeping shared by both transports of one connection.
@@ -354,14 +390,16 @@ impl RetryState {
         self.policy.exhausted(self.attempts)
     }
 
-    /// Sleeps the current backoff, then doubles it. `false` means `stop()` was
-    /// signalled and the caller must not loop again.
-    async fn wait(&mut self, stop: &mut watch::Receiver<bool>) -> bool {
+    /// Sleeps `delay`, or else the current backoff and then doubles it. `false`
+    /// means `stop()` was signalled and the caller must not loop again.
+    async fn wait(&mut self, stop: &mut watch::Receiver<bool>, delay: Option<Duration>) -> bool {
         tokio::select! {
-            _ = tokio::time::sleep(self.backoff) => {}
+            _ = tokio::time::sleep(delay.unwrap_or(self.backoff)) => {}
             _ = stop.wait_for(|stopped| *stopped) => return false,
         }
-        self.backoff = self.backoff.saturating_mul(2).min(self.policy.max_backoff);
+        if delay.is_none() {
+            self.backoff = self.backoff.saturating_mul(2).min(self.policy.max_backoff);
+        }
         true
     }
 }
@@ -709,6 +747,7 @@ impl TunnelClient {
         }
 
         while !self.stopped() {
+            let attempt = retry.next_attempt();
             let outcome = match self
                 .quic_attempt(
                     &mut endpoint,
@@ -738,10 +777,13 @@ impl TunnelClient {
                 }
             };
 
-            if outcome == SessionOutcome::Stopped {
-                return Ok(());
-            }
-            if let Some(reason) = rejected.send_replace(None) {
+            let failure = match outcome {
+                SessionOutcome::Stopped => return Ok(()),
+                SessionOutcome::Lost => None,
+                SessionOutcome::NeverUp(failure) => Some(failure),
+            };
+            let mut delay = None;
+            let cause = if let Some(reason) = rejected.send_replace(None) {
                 let attempts = retry.rejected();
                 if retry.exhausted() {
                     anyhow::bail!(
@@ -749,29 +791,54 @@ impl TunnelClient {
                          last one rejected by relay: {reason}"
                     );
                 }
-            } else if outcome == SessionOutcome::Lost {
-                retry.recovered();
-            } else {
-                let attempts = retry.failed();
-                if retry.exhausted() {
-                    anyhow::bail!(
-                        "TUNNEL[{}/{}]: giving up after {} failed attempts",
-                        tag,
-                        server_addr,
-                        attempts
+                Some(format!("rejected by relay: {reason}"))
+            } else if let Some(failure) = failure {
+                if let Some(until) = failure.rate_limited_until {
+                    let wait = until
+                        .duration_since(SystemTime::now())
+                        .unwrap_or_default()
+                        .max(retry.policy.base_backoff);
+                    warn!(
+                        "TUNNEL[{tag}/{server_addr}]: rate limited by the ACME CA, \
+                         not counted against the retry budget"
                     );
+                    delay = Some(wait);
+                } else {
+                    let attempts = retry.failed();
+                    if retry.exhausted() {
+                        anyhow::bail!(
+                            "TUNNEL[{}/{}]: giving up after {} failed attempts",
+                            tag,
+                            server_addr,
+                            attempts
+                        );
+                    }
                 }
-            }
+                Some(failure.cause)
+            } else {
+                retry.recovered();
+                None
+            };
 
+            let retry_in = delay.unwrap_or(retry.backoff);
             info!(
                 "TUNNEL[{}/{}]: reconnecting in {:?} (next attempt {}/{})",
                 tag,
                 server_addr,
-                retry.backoff,
+                retry_in,
                 retry.next_attempt(),
                 retry.policy.budget_label()
             );
-            if !retry.wait(&mut stop).await {
+            if let Some(cause) = cause {
+                self.emit(ConnectionEvent::AttemptFailed {
+                    tag: tag.to_string(),
+                    server_addr: server_addr.to_string(),
+                    attempt,
+                    cause,
+                    retry_in,
+                });
+            }
+            if !retry.wait(&mut stop, delay).await {
                 return Ok(());
             }
         }
@@ -870,12 +937,12 @@ impl TunnelClient {
                 Arc::clone(&ctrl_completed),
             )
             .await;
-        let cause = match &ended {
+        let failure = match &ended {
             Err(e) => {
                 warn!("QUIC[{}/{}]: error ({})", tag, server_addr, e);
-                format!("{e:#}")
+                AttemptFailure::from_error(e)
             }
-            Ok(()) => "connection closed".to_string(),
+            Ok(()) => AttemptFailure::new("connection closed"),
         };
         if self.stopped() {
             return Some(SessionOutcome::Stopped);
@@ -886,11 +953,11 @@ impl TunnelClient {
                 tag: tag.to_string(),
                 server_addr: server_addr.to_string(),
                 transport: Transport::Quic,
-                cause,
+                cause: failure.cause,
             });
             Some(SessionOutcome::Lost)
         } else {
-            Some(SessionOutcome::NeverUp)
+            Some(SessionOutcome::NeverUp(failure))
         }
     }
 
@@ -1161,6 +1228,7 @@ impl TunnelClient {
             policy: self.config.reconnect,
             keepalive: self.config.h2_keepalive,
             rejected: rejected.clone(),
+            failed: Mutex::new(None),
         });
         for i in 0..self.config.pool_size {
             let pooled = H2Pooled {
@@ -1180,7 +1248,9 @@ impl TunnelClient {
                     info!("H2[{}/{}]: shutting down pool", tag, server_addr);
                     return SessionOutcome::Stopped;
                 }
-                _ = rejection.wait_for(|r| r.is_some()) => return SessionOutcome::NeverUp,
+                _ = rejection.wait_for(|r| r.is_some()) => {
+                    return SessionOutcome::NeverUp(shared.take_failure());
+                }
                 _ = live.wait_down() => {
                     warn!(
                         "H2[{}/{}]: pool is fully down, ending the session",
@@ -1199,7 +1269,7 @@ impl TunnelClient {
                         server_addr,
                         self.config.pool_size
                     );
-                    return SessionOutcome::NeverUp;
+                    return SessionOutcome::NeverUp(shared.take_failure());
                 }
                 joined = tasks.join_next() => {
                     if joined.is_none() {
@@ -1214,7 +1284,7 @@ impl TunnelClient {
                             server_addr,
                             self.config.pool_size
                         );
-                        return SessionOutcome::NeverUp;
+                        return SessionOutcome::NeverUp(shared.take_failure());
                     }
                 }
             }
@@ -1241,6 +1311,23 @@ struct H2Shared {
     keepalive: H2KeepAlive,
     /// Where a member records a relay rejection; ends the pool session.
     rejected: RejectSlot,
+    /// Latest member failure, reported when the pool session never came up.
+    failed: Mutex<Option<AttemptFailure>>,
+}
+
+impl H2Shared {
+    fn record_failure(&self, e: &anyhow::Error) {
+        *self.failed.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(AttemptFailure::from_error(e));
+    }
+
+    fn take_failure(&self) -> AttemptFailure {
+        self.failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_else(|| AttemptFailure::new("no pooled connection came up"))
+    }
 }
 
 /// One member of an H2 pool.
@@ -1313,6 +1400,7 @@ impl H2Pooled {
         let (mut h2, ping_pong) = match connected {
             Err(e) => {
                 warn!("{prefix}: connection failed: {e}");
+                shared.record_failure(&e);
                 return false;
             }
             Ok(h2) => h2,
@@ -1350,7 +1438,10 @@ impl H2Pooled {
                         warn!("{prefix}: rejected by relay: {}", rejected.0);
                         shared.rejected.send_replace(Some(rejected.0.clone()));
                     }
-                    None => warn!("{prefix}: control exchange failed: {e}"),
+                    None => {
+                        warn!("{prefix}: control exchange failed: {e}");
+                        shared.record_failure(&e);
+                    }
                 }
                 return false;
             }
@@ -1368,6 +1459,7 @@ impl H2Pooled {
         let acceptor = match build_tls_acceptor(user_tls_keypair, tunnel_certs) {
             Err(e) => {
                 error!("{prefix}: failed to build TLS acceptor: {e}");
+                shared.record_failure(&e);
                 return false;
             }
             Ok(acceptor) => acceptor,
@@ -2070,6 +2162,7 @@ mod tests {
             },
             keepalive: H2KeepAlive::default(),
             rejected: watch::Sender::new(None),
+            failed: Mutex::new(None),
         });
         H2Pooled {
             index: 0,

@@ -2594,7 +2594,8 @@ public object FfiConverterTypePrimaryKey: FfiConverterRustBuffer<PrimaryKey> {
 data class ReconnectConfig (
     /**
      * Consecutive failed attempts before a connection gives up. `0` is unlimited.
-     * A relay rejection counts as one, retried at `max_backoff_ms`.
+     * A relay rejection counts as one, retried at `max_backoff_ms`. An ACME
+     * rate limit counts as none; it is retried at the CA's retry time.
      */
     var `maxAttempts`: kotlin.UInt = 0u, 
     /**
@@ -2954,6 +2955,19 @@ sealed class TunnelEvent {
     }
     
     /**
+     * One attempt of a connection that is not established failed; it is
+     * retried after `retry_in_ms`. `attempt` is the failed attempt's number.
+     */
+    data class ConnectionAttemptFailed(
+        val `tag`: kotlin.String, 
+        val `serverAddr`: kotlin.String, 
+        val `attempt`: kotlin.UInt, 
+        val `cause`: kotlin.String, 
+        val `retryInMs`: kotlin.ULong) : TunnelEvent() {
+        companion object
+    }
+    
+    /**
      * One connection exhausted its reconnect budget and will not retry. The
      * tunnel as a whole may still be up on other connections.
      */
@@ -2996,12 +3010,19 @@ public object FfiConverterTypeTunnelEvent : FfiConverterRustBuffer<TunnelEvent>{
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            6 -> TunnelEvent.ConnectionGaveUp(
+            6 -> TunnelEvent.ConnectionAttemptFailed(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterUInt.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterULong.read(buf),
+                )
+            7 -> TunnelEvent.ConnectionGaveUp(
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            7 -> TunnelEvent.Failed(
+            8 -> TunnelEvent.Failed(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -3045,6 +3066,17 @@ public object FfiConverterTypeTunnelEvent : FfiConverterRustBuffer<TunnelEvent>{
                 + FfiConverterString.allocationSize(value.`serverAddr`)
                 + FfiConverterString.allocationSize(value.`transport`)
                 + FfiConverterString.allocationSize(value.`cause`)
+            )
+        }
+        is TunnelEvent.ConnectionAttemptFailed -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`tag`)
+                + FfiConverterString.allocationSize(value.`serverAddr`)
+                + FfiConverterUInt.allocationSize(value.`attempt`)
+                + FfiConverterString.allocationSize(value.`cause`)
+                + FfiConverterULong.allocationSize(value.`retryInMs`)
             )
         }
         is TunnelEvent.ConnectionGaveUp -> {
@@ -3095,15 +3127,24 @@ public object FfiConverterTypeTunnelEvent : FfiConverterRustBuffer<TunnelEvent>{
                 FfiConverterString.write(value.`cause`, buf)
                 Unit
             }
-            is TunnelEvent.ConnectionGaveUp -> {
+            is TunnelEvent.ConnectionAttemptFailed -> {
                 buf.putInt(6)
+                FfiConverterString.write(value.`tag`, buf)
+                FfiConverterString.write(value.`serverAddr`, buf)
+                FfiConverterUInt.write(value.`attempt`, buf)
+                FfiConverterString.write(value.`cause`, buf)
+                FfiConverterULong.write(value.`retryInMs`, buf)
+                Unit
+            }
+            is TunnelEvent.ConnectionGaveUp -> {
+                buf.putInt(7)
                 FfiConverterString.write(value.`tag`, buf)
                 FfiConverterString.write(value.`serverAddr`, buf)
                 FfiConverterString.write(value.`cause`, buf)
                 Unit
             }
             is TunnelEvent.Failed -> {
-                buf.putInt(7)
+                buf.putInt(8)
                 FfiConverterString.write(value.`cause`, buf)
                 Unit
             }
