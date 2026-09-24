@@ -1039,10 +1039,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_tunnel_client_ffi_checksum_method_tunnelclient_info() != 62830.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tunnel_client_ffi_checksum_method_tunnelclient_run() != 27727.toShort()) {
+    if (lib.uniffi_tunnel_client_ffi_checksum_method_tunnelclient_run() != 12034.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tunnel_client_ffi_checksum_method_tunnelclient_stop() != 47916.toShort()) {
+    if (lib.uniffi_tunnel_client_ffi_checksum_method_tunnelclient_stop() != 4260.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_tunnel_client_ffi_checksum_method_tunnelkey_algorithm() != 32860.toShort()) {
@@ -1054,7 +1054,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_tunnel_client_ffi_checksum_method_tunnelkey_sign() != 49881.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_tunnel_client_ffi_checksum_constructor_tunnelclient_new() != 35930.toShort()) {
+    if (lib.uniffi_tunnel_client_ffi_checksum_constructor_tunnelclient_new() != 50543.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1384,6 +1384,29 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 /**
  * @suppress
  */
+public object FfiConverterULong: FfiConverter<ULong, Long> {
+    override fun lift(value: Long): ULong {
+        return value.toULong()
+    }
+
+    override fun read(buf: ByteBuffer): ULong {
+        return lift(buf.getLong())
+    }
+
+    override fun lower(value: ULong): Long {
+        return value.toLong()
+    }
+
+    override fun allocationSize(value: ULong) = 8UL
+
+    override fun write(value: ULong, buf: ByteBuffer) {
+        buf.putLong(value.toLong())
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
     override fun lift(value: Byte): Boolean {
         return value.toInt() != 0
@@ -1580,7 +1603,8 @@ public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
 
 
 /**
- * Foreign-implemented event sink. Receives lifecycle and ACME events.
+ * Foreign-implemented event sink. Receives lifecycle, per-connection and
+ * ACME events; see [`TunnelClient::run`] for the order they arrive in.
  */
 public interface Handler {
     
@@ -1590,7 +1614,8 @@ public interface Handler {
 }
 
 /**
- * Foreign-implemented event sink. Receives lifecycle and ACME events.
+ * Foreign-implemented event sink. Receives lifecycle, per-connection and
+ * ACME events; see [`TunnelClient::run`] for the order they arrive in.
  */
 open class HandlerImpl: Disposable, AutoCloseable, Handler
 {
@@ -1890,8 +1915,33 @@ public interface TunnelClientInterface {
     
     fun `info`(): TunnelInfo
     
+    /**
+     * Drives the tunnel until it stops or fails.
+     *
+     * Emits `Started` once the first connection completes its control
+     * exchange, then connection and cert events in the order they happened,
+     * then exactly one terminal event — `Stopped` or `Failed`. `Failed` or
+     * `Stopped` may arrive without a prior `Started` if no connection was
+     * ever established.
+     *
+     * The terminal event is emitted even if the foreign side cancels this
+     * future, and so is anything still queued when it does — including a
+     * pending `Started`.
+     *
+     * One-shot: a second call returns [`TunnelError::Runtime`]. A *first* call
+     * that loses the race with [`TunnelClient::stop`] is not an error — the
+     * foreign wrapper legitimately constructs and immediately closes — so it
+     * emits `Stopped` and returns `Ok`.
+     */
     suspend fun `run`()
     
+    /**
+     * Signals the tunnel to shut down. Idempotent, callable from any thread.
+     *
+     * One-shot: the client is spent afterwards. A later [`TunnelClient::run`]
+     * will not start a tunnel — it emits `Stopped` and returns `Ok` — so build
+     * a new client to reconnect.
+     */
     fun `stop`()
     
     companion object
@@ -1915,6 +1965,17 @@ open class TunnelClient: Disposable, AutoCloseable, TunnelClientInterface
         this.pointer = null
         this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
     }
+    /**
+     * Builds the client and binds its identities.
+     *
+     * **Do not construct this on `Dispatchers.Default`.** The constructor
+     * generates the secondary CSR, which calls the foreign `sign` and blocks
+     * the calling thread until it answers — while uniffi dispatches that
+     * foreign `sign` onto `Dispatchers.Default`. On a small-core device the
+     * two can be the same, very small, pool, and the call self-deadlocks until
+     * [`SIGN_TIMEOUT`] expires and construction fails. Construct on
+     * `Dispatchers.IO` (the Kotlin wrapper does this for you).
+     */
     constructor(`config`: TunnelConfig, `secondaryKey`: TunnelKey?, `handler`: Handler) :
         this(
     uniffiRustCallWithError(TunnelException) { _status ->
@@ -1999,6 +2060,25 @@ open class TunnelClient: Disposable, AutoCloseable, TunnelClientInterface
     
 
     
+    /**
+     * Drives the tunnel until it stops or fails.
+     *
+     * Emits `Started` once the first connection completes its control
+     * exchange, then connection and cert events in the order they happened,
+     * then exactly one terminal event — `Stopped` or `Failed`. `Failed` or
+     * `Stopped` may arrive without a prior `Started` if no connection was
+     * ever established.
+     *
+     * The terminal event is emitted even if the foreign side cancels this
+     * future, and so is anything still queued when it does — including a
+     * pending `Started`.
+     *
+     * One-shot: a second call returns [`TunnelError::Runtime`]. A *first* call
+     * that loses the race with [`TunnelClient::stop`] is not an error — the
+     * foreign wrapper legitimately constructs and immediately closes — so it
+     * emits `Stopped` and returns `Ok`.
+     */
+    @Throws(TunnelException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
     override suspend fun `run`() {
         return uniffiRustCallAsync(
@@ -2015,11 +2095,18 @@ open class TunnelClient: Disposable, AutoCloseable, TunnelClientInterface
         { Unit },
         
         // Error FFI converter
-        UniffiNullRustCallStatusErrorHandler,
+        TunnelException.ErrorHandler,
     )
     }
 
-    override fun `stop`()
+    
+    /**
+     * Signals the tunnel to shut down. Idempotent, callable from any thread.
+     *
+     * One-shot: the client is spent afterwards. A later [`TunnelClient::run`]
+     * will not start a tunnel — it emits `Stopped` and returns `Ok` — so build
+     * a new client to reconnect.
+     */override fun `stop`()
         = 
     callWithPointer {
     uniffiRustCall() { _status ->
@@ -2499,12 +2586,66 @@ public object FfiConverterTypePrimaryKey: FfiConverterRustBuffer<PrimaryKey> {
 
 
 
+/**
+ * Retry budget for each connection's reconnect loop. `max_attempts: 0` means
+ * unlimited; the defaults are the mobile ones, see `ReconnectPolicy::mobile()`.
+ * A non-zero budget yields `ConnectionGaveUp`, then `Failed` once all have.
+ */
+data class ReconnectConfig (
+    /**
+     * Consecutive failed attempts before a connection gives up. `0` is unlimited.
+     * A relay rejection counts as one, retried at `max_backoff_ms`.
+     */
+    var `maxAttempts`: kotlin.UInt = 0u, 
+    /**
+     * First backoff interval; doubles after each failed attempt.
+     */
+    var `baseBackoffMs`: kotlin.ULong = 2000uL, 
+    /**
+     * Ceiling the doubling backoff saturates at.
+     */
+    var `maxBackoffMs`: kotlin.ULong = 60000uL, 
+    /**
+     * Bounds one connect attempt end-to-end (DNS + transport + TLS).
+     */
+    var `connectTimeoutMs`: kotlin.ULong = 10000uL
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeReconnectConfig: FfiConverterRustBuffer<ReconnectConfig> {
+    override fun read(buf: ByteBuffer): ReconnectConfig {
+        return ReconnectConfig(
+            FfiConverterUInt.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: ReconnectConfig) = (
+            FfiConverterUInt.allocationSize(value.`maxAttempts`) +
+            FfiConverterULong.allocationSize(value.`baseBackoffMs`) +
+            FfiConverterULong.allocationSize(value.`maxBackoffMs`) +
+            FfiConverterULong.allocationSize(value.`connectTimeoutMs`)
+    )
+
+    override fun write(value: ReconnectConfig, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`maxAttempts`, buf)
+            FfiConverterULong.write(value.`baseBackoffMs`, buf)
+            FfiConverterULong.write(value.`maxBackoffMs`, buf)
+            FfiConverterULong.write(value.`connectTimeoutMs`, buf)
+    }
+}
+
+
+
 data class SecondaryConnection (
     var `certExtension`: kotlin.ByteArray?, 
-    /**
-     * Local address the secondary connection forwards to. `None` → reuses the
-     * primary's `TunnelConfig.local_addr`.
-     */
     var `localAddr`: kotlin.String?
 ) {
     
@@ -2549,7 +2690,12 @@ data class TunnelConfig (
     /**
      * Pre-seeded LE cert PEM for the primary domain. Skips ACME if supplied.
      */
-    var `certPem`: kotlin.String?
+    var `certPem`: kotlin.String?, 
+    /**
+     * Reconnect budget. Unset → [`ReconnectConfig::default`] (retry forever,
+     * 2s → 60s backoff, 10s connect timeout).
+     */
+    var `reconnect`: ReconnectConfig? = null
 ) {
     
     companion object
@@ -2572,6 +2718,7 @@ public object FfiConverterTypeTunnelConfig: FfiConverterRustBuffer<TunnelConfig>
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalTypeReconnectConfig.read(buf),
         )
     }
 
@@ -2586,7 +2733,8 @@ public object FfiConverterTypeTunnelConfig: FfiConverterRustBuffer<TunnelConfig>
             FfiConverterOptionalString.allocationSize(value.`acmeEmail`) +
             FfiConverterString.allocationSize(value.`acmeCredsPath`) +
             FfiConverterBoolean.allocationSize(value.`acmeStaging`) +
-            FfiConverterOptionalString.allocationSize(value.`certPem`)
+            FfiConverterOptionalString.allocationSize(value.`certPem`) +
+            FfiConverterOptionalTypeReconnectConfig.allocationSize(value.`reconnect`)
     )
 
     override fun write(value: TunnelConfig, buf: ByteBuffer) {
@@ -2601,6 +2749,7 @@ public object FfiConverterTypeTunnelConfig: FfiConverterRustBuffer<TunnelConfig>
             FfiConverterString.write(value.`acmeCredsPath`, buf)
             FfiConverterBoolean.write(value.`acmeStaging`, buf)
             FfiConverterOptionalString.write(value.`certPem`, buf)
+            FfiConverterOptionalTypeReconnectConfig.write(value.`reconnect`, buf)
     }
 }
 
@@ -2756,8 +2905,19 @@ public object FfiConverterTypeTunnelError : FfiConverterRustBuffer<TunnelExcepti
 
 
 
+/**
+ * What the foreign side observes. See [`TunnelClient::run`] for the order
+ * these arrive in.
+ *
+ * `transport` is `"quic"` or `"h2"` — a string rather than an enum so the
+ * Kotlin surface stays a plain `when` on a value nobody has to import.
+ */
 sealed class TunnelEvent {
     
+    /**
+     * The first connection completed its control exchange. Not "run() was
+     * called": a tunnel that never reaches a relay never reports this.
+     */
     object Started : TunnelEvent()
     
     
@@ -2766,6 +2926,41 @@ sealed class TunnelEvent {
     
     data class CertIssued(
         val `pem`: kotlin.String) : TunnelEvent() {
+        companion object
+    }
+    
+    /**
+     * One connection is carrying traffic. `tag` is `"PRI"` or `"SEC"`.
+     *
+     * `transport` is per session: it can differ between sessions of one connection.
+     */
+    data class ConnectionEstablished(
+        val `tag`: kotlin.String, 
+        val `serverAddr`: kotlin.String, 
+        val `transport`: kotlin.String) : TunnelEvent() {
+        companion object
+    }
+    
+    /**
+     * One established connection dropped. Its reconnect loop will retry, so
+     * this is not terminal.
+     */
+    data class ConnectionLost(
+        val `tag`: kotlin.String, 
+        val `serverAddr`: kotlin.String, 
+        val `transport`: kotlin.String, 
+        val `cause`: kotlin.String) : TunnelEvent() {
+        companion object
+    }
+    
+    /**
+     * One connection exhausted its reconnect budget and will not retry. The
+     * tunnel as a whole may still be up on other connections.
+     */
+    data class ConnectionGaveUp(
+        val `tag`: kotlin.String, 
+        val `serverAddr`: kotlin.String, 
+        val `cause`: kotlin.String) : TunnelEvent() {
         companion object
     }
     
@@ -2790,7 +2985,23 @@ public object FfiConverterTypeTunnelEvent : FfiConverterRustBuffer<TunnelEvent>{
             3 -> TunnelEvent.CertIssued(
                 FfiConverterString.read(buf),
                 )
-            4 -> TunnelEvent.Failed(
+            4 -> TunnelEvent.ConnectionEstablished(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                )
+            5 -> TunnelEvent.ConnectionLost(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                )
+            6 -> TunnelEvent.ConnectionGaveUp(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                )
+            7 -> TunnelEvent.Failed(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -2817,6 +3028,34 @@ public object FfiConverterTypeTunnelEvent : FfiConverterRustBuffer<TunnelEvent>{
                 + FfiConverterString.allocationSize(value.`pem`)
             )
         }
+        is TunnelEvent.ConnectionEstablished -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`tag`)
+                + FfiConverterString.allocationSize(value.`serverAddr`)
+                + FfiConverterString.allocationSize(value.`transport`)
+            )
+        }
+        is TunnelEvent.ConnectionLost -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`tag`)
+                + FfiConverterString.allocationSize(value.`serverAddr`)
+                + FfiConverterString.allocationSize(value.`transport`)
+                + FfiConverterString.allocationSize(value.`cause`)
+            )
+        }
+        is TunnelEvent.ConnectionGaveUp -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`tag`)
+                + FfiConverterString.allocationSize(value.`serverAddr`)
+                + FfiConverterString.allocationSize(value.`cause`)
+            )
+        }
         is TunnelEvent.Failed -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
@@ -2841,8 +3080,30 @@ public object FfiConverterTypeTunnelEvent : FfiConverterRustBuffer<TunnelEvent>{
                 FfiConverterString.write(value.`pem`, buf)
                 Unit
             }
-            is TunnelEvent.Failed -> {
+            is TunnelEvent.ConnectionEstablished -> {
                 buf.putInt(4)
+                FfiConverterString.write(value.`tag`, buf)
+                FfiConverterString.write(value.`serverAddr`, buf)
+                FfiConverterString.write(value.`transport`, buf)
+                Unit
+            }
+            is TunnelEvent.ConnectionLost -> {
+                buf.putInt(5)
+                FfiConverterString.write(value.`tag`, buf)
+                FfiConverterString.write(value.`serverAddr`, buf)
+                FfiConverterString.write(value.`transport`, buf)
+                FfiConverterString.write(value.`cause`, buf)
+                Unit
+            }
+            is TunnelEvent.ConnectionGaveUp -> {
+                buf.putInt(6)
+                FfiConverterString.write(value.`tag`, buf)
+                FfiConverterString.write(value.`serverAddr`, buf)
+                FfiConverterString.write(value.`cause`, buf)
+                Unit
+            }
+            is TunnelEvent.Failed -> {
+                buf.putInt(7)
                 FfiConverterString.write(value.`cause`, buf)
                 Unit
             }
@@ -2944,6 +3205,38 @@ public object FfiConverterOptionalTypeTunnelKey: FfiConverterRustBuffer<TunnelKe
         } else {
             buf.put(1)
             FfiConverterTypeTunnelKey.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeReconnectConfig: FfiConverterRustBuffer<ReconnectConfig?> {
+    override fun read(buf: ByteBuffer): ReconnectConfig? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeReconnectConfig.read(buf)
+    }
+
+    override fun allocationSize(value: ReconnectConfig?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeReconnectConfig.allocationSize(value)
+        }
+    }
+
+    override fun write(value: ReconnectConfig?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeReconnectConfig.write(value, buf)
         }
     }
 }

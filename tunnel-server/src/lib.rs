@@ -1,3 +1,4 @@
+mod admission;
 mod alpn;
 mod cert;
 mod h2_listener;
@@ -8,9 +9,13 @@ mod util;
 use anyhow::Result;
 use dashmap::DashMap;
 use log::info;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 /// Handler invoked after TLS handshake to authenticate a connecting client.
@@ -27,6 +32,8 @@ use std::sync::{
 /// - `Err(...)` — deny the connection (the error message is logged).
 pub type AuthHandler = Arc<dyn Fn(&[u8], Option<&[u8]>) -> Result<Option<Vec<u8>>> + Send + Sync>;
 use tokio::net::TcpListener;
+pub use tunnel_common::H2KeepAlive;
+use tunnel_common::{QUIC_KEEP_ALIVE_INTERVAL, QUIC_MAX_IDLE_TIMEOUT};
 
 type ServerChallenge = Arc<tokio::sync::Mutex<Option<(String, tokio_rustls::TlsAcceptor)>>>;
 
@@ -74,12 +81,43 @@ impl Default for AgentPool {
 /// Tracks in-progress ACME TLS-ALPN-01 challenges. When Let's Encrypt connects
 /// to port 443, we proxy the raw TCP bytes through the registered tunnel to the
 /// client, which terminates the TLS handshake and presents the ALPN cert.
-type PendingAlpnMap = Arc<DashMap<String, PendingAlpnConn>>;
+type PendingAlpnMap = Arc<DashMap<String, PendingAlpn>>;
+
+/// One registered challenge connection, tagged so a reconnecting client's entry
+/// is never removed by the cleanup of the connection it replaced.
+struct PendingAlpn {
+    token: u64,
+    conn: PendingAlpnConn,
+}
 
 #[derive(Clone)]
 enum PendingAlpnConn {
     Quic(quinn::Connection),
     H2(h2::client::SendRequest<bytes::Bytes>),
+}
+
+static PENDING_ALPN_TOKEN: AtomicU64 = AtomicU64::new(0);
+
+/// Registers `conn` for `client_id`, returning the token identifying this entry.
+fn pending_alpn_insert(pending: &PendingAlpnMap, client_id: &str, conn: PendingAlpnConn) -> u64 {
+    let token = PENDING_ALPN_TOKEN.fetch_add(1, Ordering::Relaxed);
+    pending.insert(client_id.to_string(), PendingAlpn { token, conn });
+    token
+}
+
+/// Removes `client_id`'s entry only while it is still the one `token` identifies.
+fn pending_alpn_remove(pending: &PendingAlpnMap, client_id: &str, token: u64) {
+    pending.remove_if(client_id, |_, entry| entry.token == token);
+}
+
+/// State every accepted agent connection needs, shared by both listeners.
+#[derive(Clone)]
+struct ListenerCtx {
+    agents: AgentMap,
+    pending: PendingAlpnMap,
+    domain_suffixes: Arc<Vec<String>>,
+    auth_handler: Option<AuthHandler>,
+    resolver: Arc<hickory_resolver::TokioAsyncResolver>,
 }
 
 pub struct ServerConfig {
@@ -109,20 +147,75 @@ pub struct ServerConfig {
     pub acme_creds_path: String,
     /// Use Let's Encrypt staging environment.
     pub acme_staging: bool,
+    /// ACME directory URL to use instead of Let's Encrypt (e.g. a Pebble test server).
+    pub acme_directory_url: Option<String>,
+    /// PEM root CA to trust for the ACME server's HTTPS API instead of the default roots.
+    pub acme_root_ca_path: Option<String>,
     /// Renew the server ACME cert this many days before expiry (default 30).
     /// Only applies when `acme_domain` is set; externally managed certs are unaffected.
     pub acme_renew_days_before_expiry: u32,
-    /// Optional callback for client authentication. Called after extracting the
-    /// client certificate's public key and custom extension data but before the
-    /// control exchange. If the handler returns `Err`, the connection is denied.
-    /// When `None`, all clients are accepted (current behavior).
+    /// Optional callback for client authentication, called before the control
+    /// exchange; an `Err` denies the connection. `None` accepts all clients.
     pub auth_handler: Option<AuthHandler>,
+    /// PING liveness for H2 agent connections; QUIC agents have the transport's
+    /// own keep-alive.
+    pub h2_keepalive: H2KeepAlive,
 }
 
+/// Bounds the memory an unauthenticated QUIC peer can park; the client itself
+/// opens only the control stream toward the server.
+const QUIC_MAX_BIDI_STREAMS: u32 = 256;
+/// No uni streams are used by this protocol in either direction.
+const QUIC_MAX_UNI_STREAMS: u32 = 0;
+const QUIC_STREAM_RECEIVE_WINDOW: u32 = 1024 * 1024;
+/// Total in-flight bytes a single connection may buffer; ~16 MB is >1 Gbit/s at
+/// a 100 ms RTT, so it never throttles legitimate tunnel data.
+const QUIC_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
+
+/// How long a shutdown waits for queued CONNECTION_CLOSE frames to reach peers.
+const SHUTDOWN_FLUSH: Duration = Duration::from_secs(2);
+/// Close reason peers see when the relay shuts down.
+const SHUTDOWN_REASON: &[u8] = b"relay shutting down";
+
+/// Aborts the task when dropped, so no exit path of `run_until` detaches it.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Closes the endpoint when dropped, so agents get a close frame rather than
+/// waiting out their idle timeout.
+struct CloseOnDrop(quinn::Endpoint);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close(quinn::VarInt::from_u32(0), SHUTDOWN_REASON);
+    }
+}
+
+fn quic_transport_config() -> Result<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(QUIC_MAX_BIDI_STREAMS.into());
+    transport.max_concurrent_uni_streams(QUIC_MAX_UNI_STREAMS.into());
+    transport.stream_receive_window(QUIC_STREAM_RECEIVE_WINDOW.into());
+    transport.receive_window(QUIC_RECEIVE_WINDOW.into());
+    transport.max_idle_timeout(Some(QUIC_MAX_IDLE_TIMEOUT.try_into()?));
+    transport.keep_alive_interval(Some(QUIC_KEEP_ALIVE_INTERVAL));
+    Ok(transport)
+}
+
+/// Runs the relay until its public listener ends.
 pub async fn run(config: ServerConfig) -> Result<()> {
-    // Multiple rustls crypto providers (ring + aws-lc-rs) can be pulled in by
-    // transitive deps, leaving no auto-detected default. Install ring explicitly;
-    // ignore Err (already installed by another caller).
+    run_until(config, std::future::pending()).await
+}
+
+/// [`run`] that also returns once `shutdown` resolves, closing the QUIC
+/// endpoint first so agents fail over at once instead of timing out.
+pub async fn run_until(config: ServerConfig, shutdown: impl Future<Output = ()>) -> Result<()> {
+    // Err means another caller already installed a provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let api_addr = format!("{}:{}", config.bind_addr, config.api_port);
     let pub_addr = format!("{}:{}", config.bind_addr, config.pub_port);
@@ -141,28 +234,24 @@ pub async fn run(config: ServerConfig) -> Result<()> {
     let agents: AgentMap = Arc::new(DashMap::new());
     let server_challenge: ServerChallenge = Arc::new(tokio::sync::Mutex::new(None));
 
-    // Start accepting on the public listener before cert selection: the server's
-    // own ACME TLS-ALPN-01 challenge must be *serviced* (accepted + handshaked)
-    // while provision_acme_cert() runs, otherwise a cold provision deadlocks —
-    // binding alone leaves the connection in the kernel backlog with no accept().
-    // The public branch is a no-op until clients register (agents empty).
+    // Accept before cert selection: the server's own challenge must be serviced
+    // while provision_acme_cert() runs, or a cold provision deadlocks.
     let pub_listener = TcpListener::bind(&pub_addr).await?;
-    let pub_handle = tokio::spawn(public::run_public_listener(
+    let mut pub_handle = AbortOnDrop(tokio::spawn(public::run_public_listener(
         pub_listener,
         agents.clone(),
         pending_alpn.clone(),
         server_challenge.clone(),
-    ));
+    )));
 
     let cert_paths = cert::determine_cert(&config, &server_challenge).await?;
     let server_tls = cert::build_server_tls_config(&config, &cert_paths, &server_challenge)?;
 
-    let quic_endpoint = quinn::Endpoint::server(
-        quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(server_tls.clone())?,
-        )),
-        api_addr.parse()?,
-    )?;
+    let mut quic_server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(server_tls.clone())?,
+    ));
+    quic_server_config.transport_config(Arc::new(quic_transport_config()?));
+    let quic_endpoint = quinn::Endpoint::server(quic_server_config, api_addr.parse()?)?;
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls));
     let tcp_listener = TcpListener::bind(&api_addr).await?;
 
@@ -170,24 +259,34 @@ pub async fn run(config: ServerConfig) -> Result<()> {
         hickory_resolver::config::ResolverConfig::default(),
         hickory_resolver::config::ResolverOpts::default(),
     ));
-    let auth_handler = config.auth_handler.clone();
-    tokio::spawn(quic::run_quic_listener(
-        quic_endpoint,
-        agents.clone(),
-        pending_alpn.clone(),
-        domain_suffixes.clone(),
-        auth_handler.clone(),
-        resolver.clone(),
-    ));
-    tokio::spawn(h2_listener::run_h2_listener(
+    let ctx = ListenerCtx {
+        agents: agents.clone(),
+        pending: pending_alpn.clone(),
+        domain_suffixes,
+        auth_handler: config.auth_handler.clone(),
+        resolver,
+    };
+    let _quic_handle = AbortOnDrop(tokio::spawn(quic::run_quic_listener(
+        quic_endpoint.clone(),
+        ctx.clone(),
+    )));
+    let _h2_handle = AbortOnDrop(tokio::spawn(h2_listener::run_h2_listener(
         tcp_listener,
         tls_acceptor,
-        agents.clone(),
-        pending_alpn.clone(),
-        domain_suffixes,
-        auth_handler,
-        resolver,
-    ));
+        ctx,
+        config.h2_keepalive,
+    )));
+    // Also covers a caller that simply drops this future.
+    let endpoint = CloseOnDrop(quic_endpoint);
 
-    pub_handle.await?
+    tokio::pin!(shutdown);
+    tokio::select! {
+        joined = &mut pub_handle.0 => joined?,
+        () = &mut shutdown => {
+            info!("ROUTER: shutting down");
+            endpoint.0.close(quinn::VarInt::from_u32(0), SHUTDOWN_REASON);
+            let _ = tokio::time::timeout(SHUTDOWN_FLUSH, endpoint.0.wait_idle()).await;
+            Ok(())
+        }
+    }
 }

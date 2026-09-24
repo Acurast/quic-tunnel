@@ -24,6 +24,7 @@ pub(crate) async fn register(
         if let Some(mut pool) = agents.get_mut(&id) {
             pool.remove(uid);
         }
+        agents.remove_if(&id, |_, pool| pool.is_empty());
     });
 }
 
@@ -36,21 +37,15 @@ pub(crate) fn allowed_suffix(domain: &str, suffixes: &[String]) -> bool {
         .any(|s| domain.ends_with(&format!(".{}", s)))
 }
 
-/// Derive a client_id from a SEC1-compressed P-256 public key (33 bytes,
-/// `0x02` or `0x03` followed by the X coordinate). Matches the Acurast
-/// on-chain `ecdsa::Public` encoding so a deployment's assignment pubkey
-/// hashes to the same client_id the tunnel announces.
+/// Derives a client_id from a SEC1-compressed P-256 public key (33 bytes),
+/// matching the Acurast on-chain `ecdsa::Public` encoding.
 pub(crate) fn id_from_pubkey(pubkey_sec1_compressed: &[u8]) -> String {
     hex::encode(&Sha256::digest(pubkey_sec1_compressed)[0..8])
 }
 
-/// Recover the identity public key from a P-256 recoverable ECDSA signature
-/// over the announced domain. Returns `Some(pubkey_sec1_compressed)` (33
-/// bytes) when the recovered key's id hashes to the first label of `domain`.
-///
-/// Wire format: 65 bytes — `r (32) || s (32) || v (1)` where `v` is the
-/// recovery id (0 or 1). The signed message is the full domain UTF-8 bytes,
-/// hashed implicitly with SHA-256 (ECDSA-NISTP256-SHA256).
+/// Recovers the identity public key from a 65-byte `r || s || v` P-256 signature
+/// over the announced domain. Returns `Some(pubkey_sec1_compressed)` (33 bytes)
+/// when the recovered key's id hashes to the first label of `domain`.
 pub(crate) fn recover_identity_pubkey(domain: &str, sig_recoverable: &[u8]) -> Option<Vec<u8>> {
     use p256::ecdsa::recoverable;
     use p256::elliptic_curve::sec1::ToEncodedPoint;
@@ -94,11 +89,9 @@ pub(crate) fn compute_txt_expected(deployment_source: &[u8], host: &str) -> Stri
 /// `_acu` TXT zone contains exactly this one marker authorizes any deployment.
 pub(crate) const ZERO_DEPLOYMENT_SOURCE: [u8; 64] = [0u8; 64];
 
-/// Decide whether the collected `_acu.<host>` TXT values authorize
-/// `deployment_source`. Open-domain rule: if there is exactly one TXT value and
-/// it equals `base64(sha256([0;64] || host))`, any source is authorized.
-/// Otherwise authorized iff some value equals
-/// `base64(sha256(deployment_source || host))` (current behavior).
+/// Decides whether the collected `_acu.<host>` TXT values authorize
+/// `deployment_source`: a lone `base64(sha256([0;64] || host))` authorizes any
+/// source, otherwise some value must equal `base64(sha256(source || host))`.
 pub(crate) fn txt_authorizes(values: &[&[u8]], deployment_source: &[u8], host: &str) -> bool {
     let open = compute_txt_expected(&ZERO_DEPLOYMENT_SOURCE, host);
     if values.len() == 1 && values[0] == open.as_bytes() {
