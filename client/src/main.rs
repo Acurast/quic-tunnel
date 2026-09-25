@@ -143,6 +143,15 @@ async fn main() -> Result<()> {
                 transport,
                 cause,
             } => info!("[{tag}/{server_addr}] lost over {transport}: {cause}"),
+            ConnectionEvent::AttemptFailed {
+                tag,
+                server_addr,
+                attempt,
+                cause,
+                retry_in,
+            } => info!(
+                "[{tag}/{server_addr}] attempt {attempt} failed, retrying in {retry_in:?}: {cause}"
+            ),
             ConnectionEvent::GaveUp {
                 tag,
                 server_addr,

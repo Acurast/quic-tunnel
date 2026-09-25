@@ -140,7 +140,8 @@ pub struct SecondaryConnection {
 #[derive(uniffi::Record, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReconnectConfig {
     /// Consecutive failed attempts before a connection gives up. `0` is unlimited.
-    /// A relay rejection counts as one, retried at `max_backoff_ms`.
+    /// A relay rejection counts as one, retried at `max_backoff_ms`. An ACME
+    /// rate limit counts as none; it is retried at the CA's retry time.
     #[uniffi(default = 0)]
     pub max_attempts: u32,
     /// First backoff interval; doubles after each failed attempt.
@@ -236,6 +237,15 @@ pub enum TunnelEvent {
         transport: String,
         cause: String,
     },
+    /// One attempt of a connection that is not established failed; it is
+    /// retried after `retry_in_ms`. `attempt` is the failed attempt's number.
+    ConnectionAttemptFailed {
+        tag: String,
+        server_addr: String,
+        attempt: u32,
+        cause: String,
+        retry_in_ms: u64,
+    },
     /// One connection exhausted its reconnect budget and will not retry. The
     /// tunnel as a whole may still be up on other connections.
     ConnectionGaveUp {
@@ -277,6 +287,19 @@ impl From<tc::ConnectionEvent> for TunnelEvent {
                 server_addr,
                 transport: transport.to_string(),
                 cause,
+            },
+            tc::ConnectionEvent::AttemptFailed {
+                tag,
+                server_addr,
+                attempt,
+                cause,
+                retry_in,
+            } => TunnelEvent::ConnectionAttemptFailed {
+                tag,
+                server_addr,
+                attempt,
+                cause,
+                retry_in_ms: u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX),
             },
             tc::ConnectionEvent::GaveUp {
                 tag,

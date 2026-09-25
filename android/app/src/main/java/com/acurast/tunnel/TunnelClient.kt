@@ -149,7 +149,9 @@ public class TunnelClient internal constructor(
  * value to let the tunnel give up instead — then [TunnelEvent.ConnectionGaveUp]
  * and, once every connection has, [TunnelEvent.Failed] follow.
  * A relay rejection counts as a failed attempt on that relay's connection only,
- * retried at the maximum backoff.
+ * retried at the maximum backoff. An ACME rate limit does not count; it is
+ * retried at the CA's retry time. Each failed attempt of a connection that is not
+ * up is reported as [TunnelEvent.ConnectionAttemptFailed].
  */
 public suspend fun CoroutineScope.TunnelClient(
     config: TunnelConfig,

@@ -9,6 +9,20 @@ pub const CERT_POLL_ROUNDS: u32 = 30;
 /// Interval between certificate-download polls.
 pub const CERT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Why an invalid order failed: the first failed challenge's problem, else the order's own.
+async fn invalid_reason(order: &mut Order) -> String {
+    let mut authorizations = order.authorizations();
+    while let Some(Ok(authz)) = authorizations.next().await {
+        if let Some(problem) = authz.challenges.iter().find_map(|c| c.error.as_ref()) {
+            return problem.to_string();
+        }
+    }
+    match &order.state().error {
+        Some(problem) => problem.to_string(),
+        None => "no reason given".to_string(),
+    }
+}
+
 /// Waits for the order to become ready, finalizes the CSR and downloads the
 /// certificate chain PEM. Both polls are bounded.
 pub async fn finalize_order(order: &mut Order, domain: &str, csr_der: &[u8]) -> Result<String> {
@@ -21,7 +35,12 @@ pub async fn finalize_order(order: &mut Order, domain: &str, csr_der: &[u8]) -> 
                 ready = true;
                 break;
             }
-            OrderStatus::Invalid => bail!("ACME order invalid for {}", domain),
+            OrderStatus::Invalid => {
+                bail!(
+                    "ACME order invalid for {domain}: {}",
+                    invalid_reason(order).await
+                )
+            }
             _ => {}
         }
         delay = delay.saturating_mul(2).min(Duration::from_secs(15));
