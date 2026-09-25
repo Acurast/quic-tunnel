@@ -16,9 +16,10 @@ log = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 uniffi = { workspace = true }
-rcgen = { workspace = true }
 rustls = { workspace = true }
-yasna = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", default-features = false }

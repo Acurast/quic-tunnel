@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 authors = ["Papers AG"]
 repository = "https://github.com/acurast"
-version = "0.1.5"
+version = "0.1.7"
 edition = "2024"
 
 [workspace.dependencies]
@@ -31,7 +31,7 @@ futures = "0.3"
 rand = "0.9"
 log = "0.4"
 env_logger = "0.11"
-instant-acme = "0.8.5"
+instant-acme = { version = "0.8.5", default-features = false, features = ["hyper-rustls", "ring"] }
 x509-parser = "0.18"
 rustls-pemfile = "2"
 rustls-native-certs = "0.8"

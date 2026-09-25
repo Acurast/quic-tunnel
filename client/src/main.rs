@@ -1,9 +1,14 @@
 use anyhow::Result;
 use clap::Parser;
 use log::{error, info};
-use std::{path::Path, sync::Arc};
-use tunnel_client::key::KeyAlgorithm;
-use tunnel_client::{TunnelClient, TunnelConfig, TunnelIdentityConfig, TunnelKey};
+use std::{path::Path, sync::Arc, time::Duration};
+use tunnel_client::{
+    ConnectionEvent, RcgenKey, ReconnectPolicy, TunnelClient, TunnelConfig, TunnelIdentityConfig,
+    TunnelKey,
+};
+
+/// How long Ctrl-C waits for the tunnel task to wind down before abandoning it.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Parser)]
 struct Args {
@@ -67,48 +72,6 @@ struct Args {
     secondary_cert_extension_hex: Option<String>,
 }
 
-/// CLI-local `TunnelKey` backed by a file-system PKCS#8 keypair.
-#[derive(Debug)]
-struct LocalKey {
-    keypair: rcgen::KeyPair,
-    raw_pub: Vec<u8>,
-    algorithm: KeyAlgorithm,
-}
-
-impl LocalKey {
-    fn from_der(der: Vec<u8>) -> Result<Self> {
-        let keypair = rcgen::KeyPair::try_from(der.as_slice())?;
-        let raw_pub = keypair.public_key_raw().to_vec();
-        let algorithm = if keypair.is_compatible(&rcgen::PKCS_ECDSA_P256_SHA256) {
-            KeyAlgorithm::EcdsaP256
-        } else if keypair.is_compatible(&rcgen::PKCS_ED25519) {
-            KeyAlgorithm::Ed25519
-        } else {
-            anyhow::bail!("unsupported keypair algorithm in PKCS#8 file");
-        };
-        Ok(Self {
-            keypair,
-            raw_pub,
-            algorithm,
-        })
-    }
-}
-
-impl TunnelKey for LocalKey {
-    fn algorithm(&self) -> KeyAlgorithm {
-        self.algorithm
-    }
-    fn public_key_raw(&self) -> Vec<u8> {
-        self.raw_pub.clone()
-    }
-    fn sign(&self, msg: &[u8]) -> Result<Vec<u8>> {
-        use rcgen::SigningKey;
-        self.keypair
-            .sign(msg)
-            .map_err(|e| anyhow::anyhow!("rcgen sign failed: {e}"))
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -118,9 +81,9 @@ async fn main() -> Result<()> {
         Some(path) => Some(load_or_generate_keypair(path)?),
         None => None,
     };
-    let primary_identity: Arc<dyn TunnelKey> = Arc::new(LocalKey::from_der(primary_der)?);
+    let primary_identity: Arc<dyn TunnelKey> = Arc::new(RcgenKey::from_pkcs8_der(&primary_der)?);
     let self_signed_identity: Option<Arc<dyn TunnelKey>> = match secondary_der {
-        Some(der) => Some(Arc::new(LocalKey::from_der(der)?)),
+        Some(der) => Some(Arc::new(RcgenKey::from_pkcs8_der(&der)?)),
         None => None,
     };
 
@@ -168,10 +131,39 @@ async fn main() -> Result<()> {
                 }
             }))
         },
+        on_connection_event: Some(Arc::new(|ev: ConnectionEvent| match ev {
+            ConnectionEvent::Established {
+                tag,
+                server_addr,
+                transport,
+            } => info!("[{tag}/{server_addr}] established over {transport}"),
+            ConnectionEvent::Lost {
+                tag,
+                server_addr,
+                transport,
+                cause,
+            } => info!("[{tag}/{server_addr}] lost over {transport}: {cause}"),
+            ConnectionEvent::AttemptFailed {
+                tag,
+                server_addr,
+                attempt,
+                cause,
+                retry_in,
+            } => info!(
+                "[{tag}/{server_addr}] attempt {attempt} failed, retrying in {retry_in:?}: {cause}"
+            ),
+            ConnectionEvent::GaveUp {
+                tag,
+                server_addr,
+                cause,
+            } => info!("[{tag}/{server_addr}] gave up: {cause}"),
+        })),
         primary_identity: TunnelIdentityConfig {
             keypair: primary_identity,
             cert_extension: primary_cert_extension,
         },
+        reconnect: ReconnectPolicy::default(),
+        h2_keepalive: Default::default(),
         self_signed_identity: self_signed_identity_config,
     };
 
@@ -184,7 +176,7 @@ async fn main() -> Result<()> {
     }
 
     let c = Arc::clone(&client);
-    let tunnel = tokio::spawn(async move { c.run().await });
+    let mut tunnel = tokio::spawn(async move { c.run().await });
 
     // Exit on Ctrl-C, or when the tunnel ends on its own (e.g. a terminal
     // rejection by the relay) — surfacing its error so the process fails fast
@@ -192,9 +184,17 @@ async fn main() -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             client.stop();
+            // Returning here would drop the runtime mid-shutdown, killing the
+            // connection tasks before quinn/h2 flush their close frames and
+            // leaving the relay to time the client out. Bounded, so a wedged
+            // task can't hold the process open.
+            if tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut tunnel).await.is_err() {
+                log::warn!("tunnel did not shut down within {SHUTDOWN_TIMEOUT:?}; aborting");
+                tunnel.abort();
+            }
             Ok(())
         }
-        res = tunnel => match res {
+        res = &mut tunnel => match res {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
                 error!("tunnel stopped: {e:#}");

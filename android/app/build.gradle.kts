@@ -10,7 +10,7 @@ plugins {
 object Library {
     const val groupId = "com.github.acurast"
     const val artifactId = "quic-tunnel"
-    const val version = "0.1.5"
+    const val version = "0.1.7"
 }
 
 android {
@@ -103,6 +103,8 @@ val ffiBuild: TaskProvider<Task> = tasks.register("ffiBuild", Task::class.java) 
 tasks.configureEach {
     if (name == "mergeDebugJniLibFolders" || name == "mergeReleaseJniLibFolders") {
         dependsOn("ffiBuild")
+        // The rust plugin's jniLibs dir is merged but not tracked, so a rebuilt .so would be skipped.
+        inputs.dir(layout.buildDirectory.dir("rustJniLibs/android")).withPropertyName("rustJniLibs")
     }
 }
 

@@ -4,25 +4,16 @@
 //! consumed by the Android `tunnel-client` library and other foreign-language
 //! clients. All foreign-facing surface lives in [`ffi`].
 
-#[cfg(any(target_os = "android", target_os = "ios"))]
+// `test` joins the list so the foreign surface can be unit-tested on the host.
+#[cfg(any(target_os = "android", target_os = "ios", test))]
 uniffi::setup_scaffolding!();
 
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(any(target_os = "android", target_os = "ios", test))]
 pub mod ffi;
 
-/// JNI entry point that wires `android_logger` so transitive logs from
-/// hyper / quinn / instant-acme / rustls / tunnel_client reach logcat.
-/// Must be invoked once before any tunnel operation.
-///
-/// `filter_spec` is an env_logger-style filter string (e.g. `"info"`,
-/// `"debug"`, `"tunnel_client=trace,hyper=info"`). Caller picks the level —
-/// typically `BuildConfig.DEBUG` → `"debug"`, otherwise `"info"`. If the
-/// string fails to parse, the filter falls back to `"info"`.
-///
-/// Called from the Kotlin wrapper
-/// (e.g. `TunnelClient.initAndroid("debug")`). `_class` is the implicit
-/// `jclass` argument that the JVM pushes for any static native method —
-/// declared but unused.
+/// JNI entry point that wires `android_logger` to logcat; invoke once before
+/// any tunnel operation. `filter_spec` is an env_logger-style filter string
+/// (e.g. `"tunnel_client=trace,hyper=info"`), falling back to `"info"`.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_acurast_tunnel_TunnelClient_initAndroid(
@@ -41,14 +32,10 @@ pub extern "system" fn Java_com_acurast_tunnel_TunnelClient_initAndroid(
         android_logger::Config::default()
             .with_max_level(max_level)
             .with_tag("tunnel_client_ffi")
-            // env_logger-style spec so transitive crates (hyper, quinn,
-            // instant-acme, rustls, tunnel_client) can be individually
-            // throttled if the caller chooses.
+            // env_logger-style spec, so transitive crates can be throttled individually.
             .with_filter(android_logger::FilterBuilder::new().parse(&spec).build()),
     );
-    // Force-set the log crate's max level after init_once. android_logger only
-    // sets it when it actually installs the logger (first call); a no-op call
-    // would otherwise leave the runtime filter at its previous value.
+    // android_logger only sets this when it actually installs the logger.
     log::set_max_level(max_level);
     log::info!(
         "tunnel-client-ffi: logger initialized (filter={}, max_level={:?})",
@@ -57,9 +44,8 @@ pub extern "system" fn Java_com_acurast_tunnel_TunnelClient_initAndroid(
     );
 }
 
-/// Pick the most verbose level mentioned in an env_logger-style filter so
-/// `log::set_max_level` doesn't drop frames the FilterBuilder would have let
-/// through. Returns `None` if no recognisable level is present.
+/// Most verbose level mentioned in an env_logger-style filter, or `None` if it
+/// names no recognisable level.
 #[cfg(target_os = "android")]
 fn max_level_from_filter_spec(spec: &str) -> Option<log::LevelFilter> {
     use log::LevelFilter::*;

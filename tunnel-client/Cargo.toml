@@ -32,4 +32,9 @@ p256 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["webpki-tokio", "tls12", "logging", "ring", "http1", "http2"] }
+time = { version = "0.3", features = ["parsing", "macros"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1", "http2"] }
+
+[dev-dependencies]
+tunnel-server = { workspace = true }
+tokio = { workspace = true }

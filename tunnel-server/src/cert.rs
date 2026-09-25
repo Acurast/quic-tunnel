@@ -1,14 +1,14 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt,
-    NewAccount, NewOrder, OrderStatus,
+    Account, AccountBuilder, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier,
+    LetsEncrypt, NewAccount, NewOrder,
 };
 use log::{info, warn};
 use std::{
     path::Path,
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        Arc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -66,7 +66,7 @@ pub(crate) fn is_cert_expired(path: &str) -> bool {
 pub(crate) struct AcmeRenewalConfig {
     pub domain: String,
     pub email: Option<String>,
-    pub staging: bool,
+    pub directory: AcmeDirectory,
     pub creds_path: String,
     pub cert_path: String,
     pub key_path: String,
@@ -75,13 +75,76 @@ pub(crate) struct AcmeRenewalConfig {
     pub renew_before_secs: i64,
 }
 
+/// `(certified_key, loaded_at, not_after_unix_secs)`.
+type CachedCert = Option<(Arc<rustls::sign::CertifiedKey>, Instant, i64)>;
+
+const RENEWAL_RETRY_BASE: Duration = Duration::from_secs(5 * 60);
+const RENEWAL_RETRY_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Failed-renewal state; no attempt is made before `retry_at`.
+#[derive(Default)]
+struct RenewalBackoff {
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl RenewalBackoff {
+    fn record_failure(&mut self) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let delay = renewal_retry_delay(self.failures);
+        self.retry_at = Some(Instant::now() + delay);
+        delay
+    }
+}
+
+/// Doubles from `RENEWAL_RETRY_BASE` per consecutive failure, capped at `RENEWAL_RETRY_MAX`.
+fn renewal_retry_delay(failures: u32) -> Duration {
+    let exp = failures.saturating_sub(1).min(16);
+    RENEWAL_RETRY_BASE
+        .saturating_mul(1 << exp)
+        .min(RENEWAL_RETRY_MAX)
+}
+
+/// ACME server the relay provisions its own cert from.
+#[derive(Clone)]
+pub(crate) struct AcmeDirectory {
+    staging: bool,
+    url: Option<String>,
+    root_ca_path: Option<String>,
+}
+
+impl AcmeDirectory {
+    fn from_config(config: &ServerConfig) -> Self {
+        Self {
+            staging: config.acme_staging,
+            url: config.acme_directory_url.clone(),
+            root_ca_path: config.acme_root_ca_path.clone(),
+        }
+    }
+
+    fn url(&self) -> String {
+        match &self.url {
+            Some(url) => url.clone(),
+            None if self.staging => LetsEncrypt::Staging.url().to_owned(),
+            None => LetsEncrypt::Production.url().to_owned(),
+        }
+    }
+
+    fn account_builder(&self) -> Result<AccountBuilder> {
+        Ok(match &self.root_ca_path {
+            Some(path) => Account::builder_with_root(path)?,
+            None => Account::builder()?,
+        })
+    }
+}
+
 pub(crate) struct DiskCertResolver {
     cert_path: String,
     key_path: String,
-    /// Cache: `(certified_key, loaded_at, not_after_unix_secs)`.
-    cache: std::sync::Mutex<Option<(Arc<rustls::sign::CertifiedKey>, Instant, i64)>>,
+    cache: Arc<Mutex<CachedCert>>,
     renewal: Option<AcmeRenewalConfig>,
     renewing: Arc<AtomicBool>,
+    backoff: Arc<Mutex<RenewalBackoff>>,
 }
 
 impl std::fmt::Debug for DiskCertResolver {
@@ -98,9 +161,10 @@ impl DiskCertResolver {
         Self {
             cert_path: cert_path.to_string(),
             key_path: key_path.to_string(),
-            cache: std::sync::Mutex::new(None),
+            cache: Arc::new(Mutex::new(None)),
             renewal,
             renewing: Arc::new(AtomicBool::new(false)),
+            backoff: Arc::new(Mutex::new(RenewalBackoff::default())),
         }
     }
 }
@@ -110,7 +174,7 @@ impl rustls::server::ResolvesServerCert for DiskCertResolver {
         &self,
         _: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
 
         // Use cached cert if it was loaded within the last 60 seconds.
         if let Some((ck, loaded_at, _)) = cache.as_ref() {
@@ -151,7 +215,7 @@ impl DiskCertResolver {
         let not_after = self
             .cache
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(|(_, _, t)| *t)
             .unwrap_or(i64::MAX);
@@ -160,6 +224,14 @@ impl DiskCertResolver {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         if not_after - now >= renewal.renew_before_secs {
+            return;
+        }
+        let retry_at = self
+            .backoff
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retry_at;
+        if retry_at.is_some_and(|t| Instant::now() < t) {
             return;
         }
         // Only one renewal at a time.
@@ -171,36 +243,62 @@ impl DiskCertResolver {
             return;
         }
         let r = renewal.clone();
-        let flag = Arc::clone(&self.renewing);
+        let cache = Arc::clone(&self.cache);
+        let backoff = Arc::clone(&self.backoff);
+        // Released on every exit path, panics included.
+        let guard = RenewingGuard(Arc::clone(&self.renewing));
         info!(
             "DiskCertResolver: cert for {} expires in {}s, triggering background renewal",
             r.domain,
             not_after - now,
         );
         tokio::spawn(async move {
-            if let Err(e) = provision_acme_cert(
+            let _guard = guard;
+            let result = provision_acme_cert(
                 &r.domain,
                 r.email.as_deref(),
-                r.staging,
+                &r.directory,
                 &r.creds_path,
                 &r.cert_path,
                 &r.key_path,
                 r.server_challenge,
             )
             .await
-            {
-                warn!("DiskCertResolver: background ACME renewal failed: {}", e);
+            .and_then(|()| load_certified_key_from_paths(&r.cert_path, &r.key_path));
+            let mut backoff = backoff.lock().unwrap_or_else(|e| e.into_inner());
+            match result {
+                Ok((ck, not_after)) => {
+                    // Replace the cached pre-renewal cert so the next handshake doesn't renew again.
+                    *cache.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((Arc::new(ck), Instant::now(), not_after));
+                    *backoff = RenewalBackoff::default();
+                }
+                Err(e) => {
+                    let delay = backoff.record_failure();
+                    warn!(
+                        "DiskCertResolver: background ACME renewal failed (attempt {}), retrying in {}s: {}",
+                        backoff.failures,
+                        delay.as_secs(),
+                        e
+                    );
+                }
             }
-            flag.store(false, Ordering::SeqCst);
         });
     }
 }
 
-/// Decides which cert paths to use for the server TLS config.
-/// Provisions via ACME (using `server_challenge` for the TLS-ALPN-01 handshake) if needed.
-/// Returns `Some((cert_path, key_path, is_acme_managed))` or `None` for the self-signed fallback.
-/// `is_acme_managed` is `true` when the cert was provisioned/selected by the built-in ACME flow;
-/// `false` when it comes from an externally supplied cert (certbot etc.).
+/// Clears `DiskCertResolver::renewing` when the renewal task ends, however it ends.
+struct RenewingGuard(Arc<AtomicBool>);
+
+impl Drop for RenewingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Decides which cert paths to use for the server TLS config, provisioning via
+/// ACME if needed. Returns `Some((cert_path, key_path, is_acme_managed))`, or
+/// `None` for the self-signed fallback.
 pub(crate) async fn determine_cert(
     config: &ServerConfig,
     server_challenge: &ServerChallenge,
@@ -244,7 +342,7 @@ pub(crate) async fn determine_cert(
         provision_acme_cert(
             domain,
             config.acme_email.as_deref(),
-            config.acme_staging,
+            &AcmeDirectory::from_config(config),
             &config.acme_creds_path,
             &cert_p,
             &key_p,
@@ -264,7 +362,7 @@ pub(crate) async fn determine_cert(
 pub(crate) async fn provision_acme_cert(
     domain: &str,
     email: Option<&str>,
-    staging: bool,
+    directory: &AcmeDirectory,
     creds_path: &str,
     cert_path: &str,
     key_path: &str,
@@ -277,7 +375,7 @@ pub(crate) async fn provision_acme_cert(
     csr_params.distinguished_name = rcgen::DistinguishedName::new();
     let csr_der = csr_params.serialize_request(&keypair)?.der().to_vec();
 
-    let account = acme_load_or_create_account(email, staging, creds_path).await?;
+    let account = acme_load_or_create_account(email, directory, creds_path).await?;
     let mut order = account
         .new_order(&NewOrder::new(&[Identifier::Dns(domain.to_string())]))
         .await?;
@@ -300,6 +398,32 @@ pub(crate) async fn provision_acme_cert(
     let alpn_acceptor = build_alpn_acceptor(domain, &key_authorization)?;
     *server_challenge.lock().await = Some((domain.to_string(), alpn_acceptor));
 
+    // Clear the challenge acceptor on every path, error ones included.
+    let issued = finalize_acme_order(&mut order, domain, &csr_der).await;
+    *server_challenge.lock().await = None;
+    let cert_chain_pem = issued?;
+
+    write_atomic(key_path, keypair.serialize_pem()).await?;
+    write_atomic(cert_path, &cert_chain_pem).await?;
+
+    info!("ACME: server cert provisioned and saved to {}", cert_path);
+    Ok(())
+}
+
+/// Writes via a sibling temp file and rename, so readers never see a partial file.
+async fn write_atomic(path: &str, contents: impl AsRef<[u8]>) -> Result<()> {
+    let tmp = format!("{path}.tmp");
+    tokio::fs::write(&tmp, contents).await?;
+    tokio::fs::rename(&tmp, path).await?;
+    Ok(())
+}
+
+/// Marks the TLS-ALPN-01 challenge ready, then finalizes the order.
+async fn finalize_acme_order(
+    order: &mut instant_acme::Order,
+    domain: &str,
+    csr_der: &[u8],
+) -> Result<String> {
     {
         let mut authorizations = order.authorizations();
         while let Some(result) = authorizations.next().await {
@@ -314,34 +438,7 @@ pub(crate) async fn provision_acme_cert(
         }
     }
 
-    let mut delay = Duration::from_secs(2);
-    for _ in 0..12 {
-        tokio::time::sleep(delay).await;
-        let state = order.refresh().await?;
-        match state.status {
-            OrderStatus::Ready | OrderStatus::Valid => break,
-            OrderStatus::Invalid => bail!("ACME order invalid for {}", domain),
-            _ => {}
-        }
-        delay = (delay * 2).min(Duration::from_secs(15));
-    }
-
-    order.finalize_csr(&csr_der).await?;
-
-    let cert_chain_pem = loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        if let Some(pem) = order.certificate().await? {
-            break pem;
-        }
-    };
-
-    *server_challenge.lock().await = None;
-
-    tokio::fs::write(cert_path, &cert_chain_pem).await?;
-    tokio::fs::write(key_path, keypair.serialize_pem()).await?;
-
-    info!("ACME: server cert provisioned and saved to {}", cert_path);
-    Ok(())
+    tunnel_common::acme::finalize_order(order, domain, csr_der).await
 }
 
 fn load_or_generate_keypair(path: &str) -> Result<rcgen::KeyPair> {
@@ -357,29 +454,25 @@ fn load_or_generate_keypair(path: &str) -> Result<rcgen::KeyPair> {
 
 async fn acme_load_or_create_account(
     email: Option<&str>,
-    staging: bool,
+    directory: &AcmeDirectory,
     path: &str,
 ) -> Result<Account> {
     if Path::new(path).exists() {
         let json = tokio::fs::read_to_string(path).await?;
         let creds: AccountCredentials = serde_json::from_str(&json)?;
-        return Ok(Account::builder()?.from_credentials(creds).await?);
+        return Ok(directory.account_builder()?.from_credentials(creds).await?);
     }
     let contact = email.map(|e| format!("mailto:{}", e));
     let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
-    let url = if staging {
-        LetsEncrypt::Staging.url().to_owned()
-    } else {
-        LetsEncrypt::Production.url().to_owned()
-    };
-    let (account, credentials) = Account::builder()?
+    let (account, credentials) = directory
+        .account_builder()?
         .create(
             &NewAccount {
                 contact: &contact_refs,
                 terms_of_service_agreed: true,
                 only_return_existing: false,
             },
-            url,
+            directory.url(),
             None,
         )
         .await?;
@@ -399,7 +492,7 @@ pub(crate) fn build_server_tls_config(
                 config.acme_domain.as_ref().map(|domain| AcmeRenewalConfig {
                     domain: domain.clone(),
                     email: config.acme_email.clone(),
-                    staging: config.acme_staging,
+                    directory: AcmeDirectory::from_config(config),
                     creds_path: config.acme_creds_path.clone(),
                     cert_path: cert_path.clone(),
                     key_path: key_path.clone(),
@@ -425,3 +518,39 @@ pub(crate) fn build_server_tls_config(
 }
 
 use tunnel_common::SelfSignedVerifier;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renewal_retry_delay_doubles_then_caps() {
+        assert_eq!(renewal_retry_delay(1), RENEWAL_RETRY_BASE);
+        assert_eq!(renewal_retry_delay(2), RENEWAL_RETRY_BASE * 2);
+        assert_eq!(renewal_retry_delay(3), RENEWAL_RETRY_BASE * 4);
+        assert_eq!(renewal_retry_delay(10), RENEWAL_RETRY_MAX);
+        assert_eq!(renewal_retry_delay(u32::MAX), RENEWAL_RETRY_MAX);
+    }
+
+    #[test]
+    fn record_failure_sets_retry_at() {
+        let mut b = RenewalBackoff::default();
+        let before = Instant::now();
+        let d = b.record_failure();
+        assert_eq!(b.failures, 1);
+        assert!(b.retry_at.unwrap() >= before + d);
+    }
+
+    #[tokio::test]
+    async fn write_atomic_replaces_contents() {
+        let dir = std::env::temp_dir().join(format!("cert-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cert.pem");
+        let p = path.to_str().unwrap();
+        std::fs::write(&path, "old").unwrap();
+        write_atomic(p, "new").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert!(!dir.join("cert.pem.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

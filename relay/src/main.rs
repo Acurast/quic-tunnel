@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use log::info;
 use tunnel_server::ServerConfig;
 
 #[derive(Parser)]
@@ -51,6 +52,14 @@ struct Args {
     #[arg(long)]
     acme_staging: bool,
 
+    /// ACME directory URL to use instead of Let's Encrypt (e.g. a local Pebble server).
+    #[arg(long)]
+    acme_directory_url: Option<String>,
+
+    /// PEM root CA to trust for the ACME server's HTTPS API (e.g. Pebble's minica).
+    #[arg(long)]
+    acme_root_ca: Option<String>,
+
     /// Trigger background ACME cert renewal this many days before expiry.
     /// Only applies when --acme-domain is set.
     #[arg(long, default_value_t = 30)]
@@ -72,8 +81,38 @@ async fn main() -> Result<()> {
         acme_email: args.acme_email,
         acme_creds_path: args.acme_creds_path,
         acme_staging: args.acme_staging,
+        acme_directory_url: args.acme_directory_url,
+        acme_root_ca_path: args.acme_root_ca,
         acme_renew_days_before_expiry: args.acme_renew_days,
         auth_handler: None,
+        h2_keepalive: Default::default(),
     };
-    tunnel_server::run(config).await
+    tunnel_server::run_until(config, shutdown_signal()).await
+}
+
+/// Resolves on the first termination signal the platform can deliver.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(term) => term,
+        Err(e) => {
+            info!("ROUTER: SIGTERM handler unavailable ({e}), watching SIGINT only");
+            let _ = tokio::signal::ctrl_c().await;
+            info!("ROUTER: SIGINT received");
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => info!("ROUTER: SIGINT received"),
+        _ = term.recv() => info!("ROUTER: SIGTERM received"),
+    }
+}
+
+/// Resolves on the first termination signal the platform can deliver.
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    info!("ROUTER: SIGINT received");
 }
