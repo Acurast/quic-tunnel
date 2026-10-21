@@ -1,3 +1,5 @@
+env:
+  RUST_ANDROID_GRADLE_PYTHON_COMMAND: python3
 before_install:
   - sdk install java 17.0.9-tem
   - sdk use java 17.0.9-tem
