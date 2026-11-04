@@ -271,6 +271,9 @@ Server CLI flags (`./target/release/server --help`):
 | `--acme-creds-path` | `server_acme_creds.json` | ACME account persistence |
 | `--acme-staging` | off | Use Let's Encrypt staging |
 | `--acme-renew-days` | `30` | Days-before-expiry renewal trigger |
+| `--sni-passthrough` | _(none)_ | `<hostname>=<ip:port>`: public connections for this hostname are passed through unchanged to another server that terminates TLS itself (e.g. an iroh relay on the same host using this server's cert); ACME challenges for it are still answered here. Repeatable |
+
+The ACME-managed cert is checked for renewal every hour, so it is renewed even when no agent connects (e.g. on a host whose public traffic is mostly passed through).
 
 ### Client
 

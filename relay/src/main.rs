@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use log::info;
-use tunnel_server::ServerConfig;
+use tunnel_server::{ServerConfig, SniPassthrough};
 
 #[derive(Parser)]
 struct Args {
@@ -64,6 +64,22 @@ struct Args {
     /// Only applies when --acme-domain is set.
     #[arg(long, default_value_t = 30)]
     acme_renew_days: u32,
+
+    /// Pass public connections for a hostname through unchanged to another server
+    /// that terminates TLS itself, as `<hostname>=<ip:port>`. Repeatable.
+    #[arg(long, value_parser = parse_sni_passthrough)]
+    sni_passthrough: Vec<SniPassthrough>,
+}
+
+fn parse_sni_passthrough(arg: &str) -> Result<SniPassthrough, String> {
+    let (hostname, target) = arg.split_once('=').ok_or("expected <hostname>=<ip:port>")?;
+    let target = target
+        .parse()
+        .map_err(|e| format!("invalid target {target}: {e}"))?;
+    Ok(SniPassthrough {
+        hostname: hostname.to_owned(),
+        target,
+    })
 }
 
 #[tokio::main]
@@ -86,6 +102,7 @@ async fn main() -> Result<()> {
         acme_renew_days_before_expiry: args.acme_renew_days,
         auth_handler: None,
         h2_keepalive: Default::default(),
+        sni_passthrough: args.sni_passthrough,
     };
     tunnel_server::run_until(config, shutdown_signal()).await
 }

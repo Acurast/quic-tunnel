@@ -120,6 +120,11 @@ struct ListenerCtx {
     resolver: Arc<hickory_resolver::TokioAsyncResolver>,
 }
 
+/// Where the ACME-managed cert is kept when `ServerConfig::cert_path` is `None`.
+pub const DEFAULT_ACME_CERT_PATH: &str = "server_cert.pem";
+/// Where the key of the ACME-managed cert is kept when `ServerConfig::key_path` is `None`.
+pub const DEFAULT_ACME_KEY_PATH: &str = "server.key";
+
 pub struct ServerConfig {
     pub bind_addr: String,
     pub api_port: u16,
@@ -132,11 +137,11 @@ pub struct ServerConfig {
     /// allowlist is disabled and all client domains are accepted.
     pub domain_suffixes: Vec<String>,
     /// Path to PEM certificate chain. When `acme_domain` is set this is where the
-    /// provisioned cert is written/read (defaults to `"server_cert.pem"`); without
+    /// provisioned cert is written/read (defaults to [`DEFAULT_ACME_CERT_PATH`]); without
     /// `acme_domain` the cert is used as-is with no auto-renewal.
     pub cert_path: Option<String>,
-    /// Path to PEM private key matching `cert_path` (defaults to `"server.key"` when
-    /// `acme_domain` is set and `cert_path` is `None`).
+    /// Path to PEM private key matching `cert_path` (defaults to
+    /// [`DEFAULT_ACME_KEY_PATH`] when `acme_domain` is set and `cert_path` is `None`).
     pub key_path: Option<String>,
     /// Server domain for ACME TLS-ALPN-01 provisioning (e.g. `"relay.example.com"`).
     /// When set, the cert at `cert_path` is server-managed and auto-renewed.
@@ -160,6 +165,18 @@ pub struct ServerConfig {
     /// PING liveness for H2 agent connections; QUIC agents have the transport's
     /// own keep-alive.
     pub h2_keepalive: H2KeepAlive,
+    /// Hostnames whose public connections are passed through unchanged to another
+    /// server, which terminates TLS itself (e.g. an iroh relay on the same host
+    /// using this server's ACME cert). ACME challenges for them are still answered
+    /// here.
+    pub sni_passthrough: Vec<SniPassthrough>,
+}
+
+/// Public connections whose TLS SNI is `hostname` go, byte for byte, to `target`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SniPassthrough {
+    pub hostname: String,
+    pub target: std::net::SocketAddr,
 }
 
 /// Bounds the memory an unauthenticated QUIC peer can park; the client itself
@@ -237,15 +254,29 @@ pub async fn run_until(config: ServerConfig, shutdown: impl Future<Output = ()>)
     // Accept before cert selection: the server's own challenge must be serviced
     // while provision_acme_cert() runs, or a cold provision deadlocks.
     let pub_listener = TcpListener::bind(&pub_addr).await?;
+    for passthrough in &config.sni_passthrough {
+        info!(
+            "ROUTER: passing {} through to {}",
+            passthrough.hostname, passthrough.target
+        );
+    }
     let mut pub_handle = AbortOnDrop(tokio::spawn(public::run_public_listener(
         pub_listener,
         agents.clone(),
         pending_alpn.clone(),
         server_challenge.clone(),
+        Arc::new(config.sni_passthrough.clone()),
     )));
 
     let cert_paths = cert::determine_cert(&config, &server_challenge).await?;
-    let server_tls = cert::build_server_tls_config(&config, &cert_paths, &server_challenge)?;
+    let (server_tls, renewing_resolver) =
+        cert::build_server_tls_config(&config, &cert_paths, &server_challenge)?;
+    let _renewal_handle = renewing_resolver.map(|resolver| {
+        AbortOnDrop(tokio::spawn(cert::run_renewal_checks(
+            resolver,
+            cert::RENEWAL_CHECK_INTERVAL,
+        )))
+    });
 
     let mut quic_server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_tls.clone())?,

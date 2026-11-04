@@ -62,6 +62,7 @@ fn relay_config(api_port: u16, pub_port: u16) -> ServerConfig {
         acme_renew_days_before_expiry: 30,
         auth_handler: None,
         h2_keepalive: KEEPALIVE,
+        sni_passthrough: Vec::new(),
     }
 }
 

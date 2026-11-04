@@ -364,6 +364,7 @@ fn start_relay_until(
             acme_renew_days_before_expiry: 30,
             auth_handler,
             h2_keepalive,
+            sni_passthrough: Vec::new(),
         };
         // Records why the relay stopped, so dependent tests fail with a reason.
         let shutdown = async {

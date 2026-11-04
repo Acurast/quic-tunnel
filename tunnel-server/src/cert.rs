@@ -174,6 +174,14 @@ impl rustls::server::ResolvesServerCert for DiskCertResolver {
         &self,
         _: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        self.current()
+    }
+}
+
+impl DiskCertResolver {
+    /// The cert to serve, reloaded from disk at most once a minute. Starts a
+    /// background renewal when it is within the renewal window.
+    pub(crate) fn current(&self) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
 
         // Use cached cert if it was loaded within the last 60 seconds.
@@ -287,6 +295,20 @@ impl DiskCertResolver {
     }
 }
 
+/// How often [`run_renewal_checks`] looks at the cert.
+pub(crate) const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Checks the cert every `interval`, so it is renewed even when no handshake
+/// reaches this resolver, e.g. when the public traffic is passed through to
+/// another server that uses the same cert files.
+pub(crate) async fn run_renewal_checks(resolver: Arc<DiskCertResolver>, interval: Duration) {
+    let mut ticks = tokio::time::interval(interval);
+    loop {
+        ticks.tick().await;
+        resolver.current();
+    }
+}
+
 /// Clears `DiskCertResolver::renewing` when the renewal task ends, however it ends.
 struct RenewingGuard(Arc<AtomicBool>);
 
@@ -313,11 +335,11 @@ pub(crate) async fn determine_cert(
     let cert_p = config
         .cert_path
         .clone()
-        .unwrap_or_else(|| "server_cert.pem".to_string());
+        .unwrap_or_else(|| crate::DEFAULT_ACME_CERT_PATH.to_string());
     let key_p = config
         .key_path
         .clone()
-        .unwrap_or_else(|| "server.key".to_string());
+        .unwrap_or_else(|| crate::DEFAULT_ACME_KEY_PATH.to_string());
 
     if !is_cert_expired(&cert_p) {
         if is_acme {
@@ -480,11 +502,13 @@ async fn acme_load_or_create_account(
     Ok(account)
 }
 
+/// The TLS config of the agent listeners, and the resolver of an ACME-managed
+/// cert, whose renewal the caller keeps checking.
 pub(crate) fn build_server_tls_config(
     config: &ServerConfig,
     cert_paths: &Option<(String, String, bool)>,
     server_challenge: &ServerChallenge,
-) -> Result<rustls::ServerConfig> {
+) -> Result<(rustls::ServerConfig, Option<Arc<DiskCertResolver>>)> {
     let verifier = Arc::new(SelfSignedVerifier::new());
     match cert_paths {
         Some((cert_path, key_path, is_acme)) => {
@@ -502,17 +526,19 @@ pub(crate) fn build_server_tls_config(
             } else {
                 None
             };
-            Ok(rustls::ServerConfig::builder()
+            let has_renewal = renewal.is_some();
+            let resolver = Arc::new(DiskCertResolver::new(cert_path, key_path, renewal));
+            let tls = rustls::ServerConfig::builder()
                 .with_client_cert_verifier(verifier)
-                .with_cert_resolver(Arc::new(DiskCertResolver::new(
-                    cert_path, key_path, renewal,
-                ))))
+                .with_cert_resolver(resolver.clone());
+            Ok((tls, has_renewal.then_some(resolver)))
         }
         None => {
             let (c, k) = tunnel_common::cert("tunnel");
-            Ok(rustls::ServerConfig::builder()
+            let tls = rustls::ServerConfig::builder()
                 .with_client_cert_verifier(verifier)
-                .with_single_cert(vec![c], k)?)
+                .with_single_cert(vec![c], k)?;
+            Ok((tls, None))
         }
     }
 }
@@ -539,6 +565,50 @@ mod tests {
         let d = b.record_failure();
         assert_eq!(b.failures, 1);
         assert!(b.retry_at.unwrap() >= before + d);
+    }
+
+    #[tokio::test]
+    async fn renewal_checks_renew_without_handshakes() {
+        let dir = std::env::temp_dir().join(format!("cert-renew-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert_path, key_path) = (dir.join("cert.pem"), dir.join("key.pem"));
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["relay.example.com".into()]).unwrap();
+        params.not_after = rcgen::date_time_ymd(2020, 1, 2);
+        std::fs::write(&cert_path, params.self_signed(&key).unwrap().pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        let (cert_path, key_path) = (cert_path.to_str().unwrap(), key_path.to_str().unwrap());
+        // An ACME server that refuses connections: every renewal attempt fails.
+        let renewal = AcmeRenewalConfig {
+            domain: "relay.example.com".into(),
+            email: None,
+            directory: AcmeDirectory {
+                staging: false,
+                url: Some("https://127.0.0.1:1/directory".into()),
+                root_ca_path: None,
+            },
+            creds_path: dir.join("creds.json").to_str().unwrap().into(),
+            cert_path: cert_path.into(),
+            key_path: key_path.into(),
+            server_challenge: Default::default(),
+            renew_before_secs: 30 * 86400,
+        };
+        let resolver = Arc::new(DiskCertResolver::new(cert_path, key_path, Some(renewal)));
+
+        let checks = tokio::spawn(run_renewal_checks(
+            resolver.clone(),
+            Duration::from_millis(10),
+        ));
+        let attempted = tokio::time::timeout(Duration::from_secs(10), async {
+            while resolver.backoff.lock().unwrap().failures == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        checks.abort();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(attempted.is_ok(), "no renewal attempt without a handshake");
     }
 
     #[tokio::test]

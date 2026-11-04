@@ -4,18 +4,22 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tunnel_common::{H2Recv, H2Send, IO};
 
+use std::{net::SocketAddr, sync::Arc};
+
 use crate::alpn::handle_acme;
 use crate::util::extract_sni_alpn;
-use crate::{Agent, AgentMap, PendingAlpnMap, ServerChallenge};
+use crate::{Agent, AgentMap, PendingAlpnMap, ServerChallenge, SniPassthrough};
 
 /// Single public listener on port 443. Peeks the TLS ClientHello and dispatches
-/// ACME TLS-ALPN-01 challenges to [`handle_acme`] and everything else to the
-/// tunnel agent for the SNI's `client_id`, proxying raw bytes either way.
+/// ACME TLS-ALPN-01 challenges to [`handle_acme`], passthrough hostnames to their
+/// target and everything else to the tunnel agent for the SNI's `client_id`,
+/// proxying raw bytes in every case.
 pub(crate) async fn run_public_listener(
     listener: TcpListener,
     agents: AgentMap,
     pending_alpn: PendingAlpnMap,
     server_challenge: ServerChallenge,
+    passthrough: Arc<Vec<SniPassthrough>>,
 ) -> Result<()> {
     loop {
         let (stream, remote) = match listener.accept().await {
@@ -30,6 +34,7 @@ pub(crate) async fn run_public_listener(
         let agents = agents.clone();
         let pending_alpn = pending_alpn.clone();
         let server_challenge = server_challenge.clone();
+        let passthrough = passthrough.clone();
         tokio::spawn(async move {
             let (host, is_acme) =
                 match tokio::time::timeout(PEEK_TIMEOUT, peek_sni_alpn(&stream)).await {
@@ -49,6 +54,9 @@ pub(crate) async fn run_public_listener(
             if is_acme {
                 debug!("PUB: ACME challenge from {} for {}", remote, host);
                 return handle_acme(stream, &host, pending_alpn, server_challenge).await;
+            }
+            if let Some(target) = passthrough_target(&passthrough, &host) {
+                return handle_passthrough(stream, &host, remote, target).await;
             }
             handle_public(stream, &host, remote, agents).await
         });
@@ -103,6 +111,45 @@ async fn peek_sni_alpn(stream: &TcpStream) -> Option<(String, bool)> {
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(PEEK_POLL_MAX);
     }
+}
+
+/// The target configured for `host`; DNS names are case-insensitive.
+fn passthrough_target(passthrough: &[SniPassthrough], host: &str) -> Option<SocketAddr> {
+    let host = host.trim_end_matches('.');
+    passthrough
+        .iter()
+        .find(|p| p.hostname.trim_end_matches('.').eq_ignore_ascii_case(host))
+        .map(|p| p.target)
+}
+
+/// Proxy a public connection, ClientHello included, to the passthrough `target`.
+async fn handle_passthrough(
+    mut user_stream: TcpStream,
+    host: &str,
+    remote: SocketAddr,
+    target: SocketAddr,
+) -> Option<()> {
+    let mut upstream =
+        match tokio::time::timeout(TUNNEL_OPEN_TIMEOUT, TcpStream::connect(target)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                error!("PUB: passthrough for {} to {} failed: {}", host, target, e);
+                return None;
+            }
+            Err(_) => {
+                warn!(
+                    "PUB: passthrough for {} to {} timed out after {:?}",
+                    host, target, TUNNEL_OPEN_TIMEOUT
+                );
+                return None;
+            }
+        };
+    let _ = upstream.set_nodelay(true);
+    debug!("PUB: passthrough {} -> {} ({})", remote, target, host);
+    if let Err(e) = tokio::io::copy_bidirectional(&mut user_stream, &mut upstream).await {
+        debug!("PUB: passthrough closed {} -> {}: {}", remote, target, e);
+    }
+    Some(())
 }
 
 /// Proxy a public user connection to the tunnel agent for `host`'s `client_id`.
@@ -192,4 +239,27 @@ async fn handle_public(
         );
     }
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn passthrough(hostname: &str) -> Vec<SniPassthrough> {
+        vec![SniPassthrough {
+            hostname: hostname.into(),
+            target: "127.0.0.1:3443".parse().unwrap(),
+        }]
+    }
+
+    #[test]
+    fn passthrough_matches_the_hostname_only() {
+        let config = passthrough("relay.example.com");
+
+        assert!(passthrough_target(&config, "relay.example.com").is_some());
+        assert!(passthrough_target(&config, "Relay.Example.COM.").is_some());
+        assert!(passthrough_target(&config, "abc.relay.example.com").is_none());
+        assert!(passthrough_target(&config, "example.com").is_none());
+        assert!(passthrough_target(&[], "relay.example.com").is_none());
+    }
 }
