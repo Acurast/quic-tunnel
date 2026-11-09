@@ -10,7 +10,7 @@ plugins {
 object Library {
     const val groupId = "com.github.acurast"
     const val artifactId = "quic-tunnel"
-    const val version = "0.1.8"
+    const val version = "0.1.9"
 }
 
 android {

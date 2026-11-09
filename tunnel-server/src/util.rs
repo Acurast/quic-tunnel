@@ -47,12 +47,15 @@ pub(crate) fn id_from_pubkey(pubkey_sec1_compressed: &[u8]) -> String {
 /// over the announced domain. Returns `Some(pubkey_sec1_compressed)` (33 bytes)
 /// when the recovered key's id hashes to the first label of `domain`.
 pub(crate) fn recover_identity_pubkey(domain: &str, sig_recoverable: &[u8]) -> Option<Vec<u8>> {
-    use p256::ecdsa::recoverable;
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
-    let rec_sig = recoverable::Signature::try_from(sig_recoverable).ok()?;
-    let vk = rec_sig.recover_verifying_key(domain.as_bytes()).ok()?;
+    use p256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    let (sig, v) = match sig_recoverable {
+        [sig @ .., v] if sig.len() == 64 => (Signature::from_slice(sig).ok()?, *v),
+        _ => return None,
+    };
+    let vk =
+        VerifyingKey::recover_from_msg(domain.as_bytes(), &sig, RecoveryId::from_byte(v)?).ok()?;
     // Compress to match the client-side client_id derivation (33-byte SEC1).
-    let ep = vk.to_encoded_point(true);
+    let ep = vk.to_sec1_point(true);
     let pubkey = ep.as_bytes();
     let id_target = domain.split('.').next()?;
     if id_from_pubkey(pubkey) == id_target {

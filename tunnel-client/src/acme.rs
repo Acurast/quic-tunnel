@@ -573,15 +573,14 @@ mod tests {
 
     #[test]
     fn same_public_key_ignores_point_compression() {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
         let raw = rcgen::KeyPair::generate()
             .unwrap()
             .public_key_raw()
             .to_vec();
         let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&raw).unwrap();
         assert!(same_public_key(
-            vk.to_encoded_point(false).as_bytes(),
-            vk.to_encoded_point(true).as_bytes()
+            vk.to_sec1_point(false).as_bytes(),
+            vk.to_sec1_point(true).as_bytes()
         ));
     }
 }
