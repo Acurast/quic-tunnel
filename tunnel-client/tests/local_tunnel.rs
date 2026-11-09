@@ -18,7 +18,6 @@ use std::{
 };
 
 use anyhow::Result;
-use p256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -517,7 +516,7 @@ fn start_stream_starved_relay() -> Result<u16> {
 fn seeded_cert_pem(identity: &Arc<dyn TunnelKey>) -> String {
     let point = p256::ecdsa::VerifyingKey::from_sec1_bytes(&identity.public_key_raw())
         .expect("identity pubkey")
-        .to_encoded_point(true);
+        .to_sec1_point(true);
     let client_id = hex::encode(&Sha256::digest(point.as_bytes())[..8]);
     rcgen::CertificateParams::new(vec![format!("{client_id}.localhost")])
         .expect("seed cert params")

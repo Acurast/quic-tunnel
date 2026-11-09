@@ -2,7 +2,6 @@ use crate::acme::{CertProvisioner, PrepareResult, rate_limited_until};
 use crate::key::{KeyAlgorithm, RcgenRemoteKey, RustlsRemoteKey, TunnelKey};
 use anyhow::Result;
 use log::{debug, error, info, warn};
-use p256::elliptic_curve::sec1::ToEncodedPoint;
 use rustls::pki_types::CertificateDer;
 use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use sha2::{Digest, Sha256};
@@ -1669,7 +1668,7 @@ fn build_connection(
         KeyAlgorithm::EcdsaP256 => {
             let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(&identity_pub_raw)
                 .map_err(|e| anyhow::anyhow!("parse identity pubkey for client_id: {e}"))?;
-            vk.to_encoded_point(true).as_bytes().to_vec()
+            vk.to_sec1_point(true).as_bytes().to_vec()
         }
     };
     let client_id = hex::encode(&Sha256::digest(&id_bytes)[0..8]);
@@ -1729,22 +1728,19 @@ fn build_connection(
 /// Signs `msg` with `identity_keypair`, producing a 65-byte recoverable ECDSA
 /// P-256 signature (`r || s || v`).
 fn sign_recoverable(identity_keypair: &dyn TunnelKey, msg: &[u8]) -> Result<[u8; 65]> {
-    use p256::ecdsa::{Signature, VerifyingKey, recoverable};
+    use p256::ecdsa::{RecoveryId, Signature, VerifyingKey};
     let der = identity_keypair.sign(msg)?;
     let sig = Signature::from_der(&der)
         .map_err(|e| anyhow::anyhow!("parse identity signature DER: {e}"))?;
     // Trial-recovery only matches the canonical low-s form.
-    let sig = sig.normalize_s().unwrap_or(sig);
+    let sig = sig.normalize_s();
     let vk = VerifyingKey::from_sec1_bytes(&identity_keypair.public_key_raw())
         .map_err(|e| anyhow::anyhow!("identity pubkey: {e}"))?;
-    let rec = recoverable::Signature::from_trial_recovery(&vk, msg, &sig)
+    let v = RecoveryId::trial_recovery_from_msg(&vk, msg, &sig)
         .map_err(|e| anyhow::anyhow!("trial-recovery for identity signature: {e}"))?;
-    let bytes: &[u8] = rec.as_ref();
     let mut out = [0u8; 65];
-    if bytes.len() != 65 {
-        anyhow::bail!("recoverable signature length {} (expected 65)", bytes.len());
-    }
-    out.copy_from_slice(bytes);
+    out[..64].copy_from_slice(&sig.to_bytes());
+    out[64] = v.to_byte();
     Ok(out)
 }
 
