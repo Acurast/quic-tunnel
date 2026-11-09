@@ -8,8 +8,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use p256::ecdsa::{Signature, VerifyingKey, recoverable};
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 use rcgen::SigningKey;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use sha2::{Digest, Sha256};
@@ -101,16 +100,17 @@ async fn connect_retrying(port: u16) -> TcpStream {
 /// Domain and 65-byte recoverable signature binding it to `identity`.
 fn identity_proof(identity: &rcgen::KeyPair) -> (String, Vec<u8>) {
     let vk = VerifyingKey::from_sec1_bytes(identity.public_key_raw()).expect("identity pubkey");
-    let compressed = vk.to_encoded_point(true);
+    let compressed = vk.to_sec1_point(true);
     let id = hex::encode(&Sha256::digest(compressed.as_bytes())[0..8]);
     let domain = format!("{id}.localhost");
     let der = identity.sign(domain.as_bytes()).expect("sign domain");
     let sig = Signature::from_der(&der).expect("DER signature");
-    let sig = sig.normalize_s().unwrap_or(sig);
-    let rec = recoverable::Signature::from_trial_recovery(&vk, domain.as_bytes(), &sig)
-        .expect("trial recovery");
-    let bytes: &[u8] = rec.as_ref();
-    (domain, bytes.to_vec())
+    let sig = sig.normalize_s();
+    let v =
+        RecoveryId::trial_recovery_from_msg(&vk, domain.as_bytes(), &sig).expect("trial recovery");
+    let mut bytes = sig.to_bytes().to_vec();
+    bytes.push(v.to_byte());
+    (domain, bytes)
 }
 
 async fn next_request(conn: &mut AgentConn, expected: &str) -> CtrlReq {
